@@ -1,220 +1,117 @@
-﻿/**
- * 媒体嗅探器 - Content Script
- * 注入到页面中，hook 原生 API 捕获媒体资源 URL
+/**
+ * 媒体嗅探器 - 内容脚本
+ * 负责页面扫描、接收主世界桥接结果、渲染页面浮层，以及页面内抓取兜底。
  */
 
 ;(function () {
   'use strict'
+
   if (window.__mediaSnifferInjected) return
   window.__mediaSnifferInjected = true
 
-  const MEDIA_EXT_RE = /\.(mp3|wav|flac|m4a|ogg|aac|wma|opus|mp4|webm|mkv|mov|avi|m3u8|ts|m4s|mpd|jpg|jpeg|png|gif|webp|bmp|svg|avif)(\?|$)/i
-  const AUDIO_EXT_RE = /\.(mp3|wav|flac|m4a|ogg|aac|wma|opus)(\?|$)/i
-  const VIDEO_EXT_RE = /\.(mp4|webm|mkv|mov|avi|m3u8|ts|m4s|mpd)(\?|$)/i
-  const IMAGE_EXT_RE = /\.(jpg|jpeg|png|gif|webp|bmp|svg|avif)(\?|$)/i
-
-  const PLATFORM_STRATEGIES = [
-    {
-      name: 'aigei',
-      host: /(^|\.)aigei\.com$/i,
-      extraMediaExt: /\.(zip|rar)(\?|$)/i,
-      extraIgnore: [],
-    },
-    {
-      name: 'generic',
-      host: /.*/,
-      extraMediaExt: null,
-      extraIgnore: [],
-    },
-  ]
-
+  const Shared = window.MediaSnifferShared
   const reported = new Set()
+  let dockRoot = null
+  let dockActiveTab = 'video'
+  let dockMedia = []
 
-  function getPlatformStrategy(url) {
-    try {
-      const host = new URL(url, location.href).hostname
-      return PLATFORM_STRATEGIES.find((s) => s.host.test(host)) || PLATFORM_STRATEGIES[PLATFORM_STRATEGIES.length - 1]
-    } catch (_) {
-      return PLATFORM_STRATEGIES[PLATFORM_STRATEGIES.length - 1]
-    }
-  }
+  const DOCK_TAB_ORDER = ['video', 'image', 'audio', 'other']
+  const DOCK_TAB_LABEL = { video: '视频', image: '图片', audio: '音频', other: '其他' }
 
-  function inferCategory(url) {
-    if (AUDIO_EXT_RE.test(url)) return 'audio'
-    if (VIDEO_EXT_RE.test(url)) return 'video'
-    if (IMAGE_EXT_RE.test(url)) return 'image'
-    return 'other'
-  }
+  function reportMedia(url, source, extra) {
+    const absUrl = Shared.toAbsoluteUrl(url, location.href)
+    const contentType = extra?.contentType || ''
+    if (!Shared.shouldCaptureResource(absUrl, contentType, location.href)) return
 
-  function report(url, source) {
-    if (!url || typeof url !== 'string') return
-    if (!url.startsWith('http')) return
-    if (url.startsWith('chrome-extension://')) return
-    const strategy = getPlatformStrategy(url)
-    if ((strategy.extraIgnore || []).some((p) => p.test(url))) return
-    const isMediaByDefault = MEDIA_EXT_RE.test(url)
-    const isMediaByStrategy = !!strategy.extraMediaExt && strategy.extraMediaExt.test(url)
-    if (!isMediaByDefault && !isMediaByStrategy) return
-    if (reported.has(url)) return
-    reported.add(url)
-
-    let filename = 'media'
-    try {
-      const name = new URL(url).pathname.split('/').pop()
-      if (name && name.length > 1) filename = decodeURIComponent(name.split('?')[0])
-    } catch (_) {}
+    const categoryHint = extra?.categoryHint || ''
+    const category = Shared.inferCategory(absUrl, contentType, categoryHint)
+    const key = `${absUrl}:${contentType}:${category}:${source}`
+    if (reported.has(key)) return
+    reported.add(key)
 
     chrome.runtime.sendMessage({
-      type: 'mediaFound',
-      url,
-      filename,
-      category: inferCategory(url),
-      platform: strategy.name,
+      type: Shared.MESSAGE_TYPES.MEDIA_FOUND,
+      url: absUrl,
+      filename: Shared.extractFilename(absUrl),
+      category,
+      categoryHint,
+      platform: Shared.getPlatformStrategy(absUrl, location.href).name,
+      contentType,
       referer: location.href,
       source,
     })
   }
 
-  const origSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src')
-  if (origSrcDesc && origSrcDesc.set) {
-    Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-      get: origSrcDesc.get,
-      set(val) {
-        report(val, 'element')
-        return origSrcDesc.set.call(this, val)
-      },
-      configurable: true,
-      enumerable: true,
-    })
-  }
+  function reportElementMedia(el, source) {
+    if (!el || el.nodeType !== 1) return
 
-  const OrigAudio = window.Audio
-  window.Audio = function (src) {
-    if (src) report(src, 'audio-constructor')
-    return new OrigAudio(src)
-  }
-  window.Audio.prototype = OrigAudio.prototype
+    const tagName = String(el.tagName || '').toUpperCase()
+    if (tagName === 'AUDIO' || tagName === 'VIDEO') {
+      const categoryHint = tagName === 'AUDIO' ? 'audio' : 'video'
+      if (el.src) reportMedia(el.src, source, { categoryHint })
+      if (el.currentSrc && el.currentSrc !== el.src) reportMedia(el.currentSrc, source, { categoryHint })
+      if (el.poster) reportMedia(el.poster, source, { categoryHint: 'image' })
+      el.querySelectorAll('source').forEach((sourceNode) => {
+        if (sourceNode.src) reportMedia(sourceNode.src, source, { categoryHint })
+      })
+    }
 
-  const origSourceSrcDesc = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, 'src')
-  if (origSourceSrcDesc && origSourceSrcDesc.set) {
-    Object.defineProperty(HTMLSourceElement.prototype, 'src', {
-      get: origSourceSrcDesc.get,
-      set(val) {
-        report(val, 'element')
-        return origSourceSrcDesc.set.call(this, val)
-      },
-      configurable: true,
-      enumerable: true,
-    })
-  }
-
-  const origFetch = window.fetch
-  window.fetch = function (input) {
-    let url = ''
-    if (typeof input === 'string') url = input
-    else if (input instanceof Request) url = input.url
-    else if (input instanceof URL) url = input.href
-    if (url) report(url, 'fetch')
-    return origFetch.apply(this, arguments)
-  }
-
-  const origXhrOpen = XMLHttpRequest.prototype.open
-  XMLHttpRequest.prototype.open = function (method, url) {
-    if (url) {
-      try {
-        report(new URL(url, location.href).href, 'xhr')
-      } catch (_) {
-        report(url, 'xhr')
+    if (tagName === 'IMG' && el.src) reportMedia(el.src, source, { categoryHint: 'image' })
+    if (tagName === 'SOURCE') {
+      if (el.src) reportMedia(el.src, source, { categoryHint: 'video' })
+      if (el.srcset) {
+        el.srcset.split(',').forEach((item) => {
+          const candidate = item.trim().split(' ')[0]
+          if (candidate) reportMedia(candidate, source, { categoryHint: 'image' })
+        })
       }
     }
-    return origXhrOpen.apply(this, arguments)
+    if (tagName === 'A' && el.href) reportMedia(el.href, source, { categoryHint: 'other' })
   }
 
   function scanExisting() {
-    document.querySelectorAll('audio, video').forEach((el) => {
-      if (el.src) report(el.src, 'scan')
-      if (el.currentSrc && el.currentSrc !== el.src) report(el.currentSrc, 'scan')
-      el.querySelectorAll('source').forEach((s) => {
-        if (s.src) report(s.src, 'scan')
-      })
-    })
-
-    document.querySelectorAll('img[src], source[srcset], video[poster], a[href]').forEach((el) => {
-      if (el.tagName === 'IMG' && el.src) report(el.src, 'scan')
-      if (el.tagName === 'VIDEO' && el.poster) report(el.poster, 'scan')
-      if (el.tagName === 'A' && el.href) report(el.href, 'scan')
-      if (el.tagName === 'SOURCE') {
-        if (el.src) report(el.src, 'scan')
-        if (el.srcset) {
-          el.srcset.split(',').forEach((item) => {
-            const candidate = item.trim().split(' ')[0]
-            if (candidate) {
-              try {
-                report(new URL(candidate, location.href).href, 'scan')
-              } catch (_) {}
-            }
-          })
-        }
-      }
+    document.querySelectorAll('audio, video, img, source, a[href]').forEach((el) => {
+      reportElementMedia(el, 'scan')
     })
   }
 
   const observer = new MutationObserver((mutations) => {
-    for (const mut of mutations) {
-      for (const node of mut.addedNodes) {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
         if (node.nodeType !== 1) continue
-
-        if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') {
-          if (node.src) report(node.src, 'element')
-          if (node.currentSrc) report(node.currentSrc, 'element')
-          node.querySelectorAll('source').forEach((s) => {
-            if (s.src) report(s.src, 'element')
-          })
-          if (node.poster) report(node.poster, 'element')
-        }
-
-        if (node.tagName === 'IMG' && node.src) report(node.src, 'element')
-        if (node.tagName === 'SOURCE' && node.src) report(node.src, 'element')
-
+        reportElementMedia(node, 'element')
         if (node.querySelectorAll) {
-          node.querySelectorAll('audio, video, img, source, a[href]').forEach((el) => {
-            if (el.src) report(el.src, 'element')
-            if (el.currentSrc) report(el.currentSrc, 'element')
-            if (el.href) report(el.href, 'element')
-            if (el.poster) report(el.poster, 'element')
+          node.querySelectorAll('audio, video, img, source, a[href]').forEach((child) => {
+            reportElementMedia(child, 'element')
           })
         }
       }
 
-      if (mut.type === 'attributes') {
-        const el = mut.target
-        if (!el || el.nodeType !== 1) continue
-        if (mut.attributeName === 'src' && el.src) report(el.src, 'element')
-        if (mut.attributeName === 'poster' && el.poster) report(el.poster, 'element')
-        if (mut.attributeName === 'href' && el.href) report(el.href, 'element')
-        if (mut.attributeName === 'srcset' && el.srcset) {
-          el.srcset.split(',').forEach((item) => {
-            const candidate = item.trim().split(' ')[0]
-            if (candidate) {
-              try {
-                report(new URL(candidate, location.href).href, 'element')
-              } catch (_) {}
-            }
-          })
-        }
+      if (mutation.type === 'attributes') {
+        reportElementMedia(mutation.target, 'element')
       }
     }
   })
 
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ['src', 'poster', 'href', 'srcset'],
+  if (document.documentElement) {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'poster', 'href', 'srcset'],
+    })
+  }
+
+  window.addEventListener(Shared.BRIDGE_EVENT_NAME, (event) => {
+    const detail = event.detail || {}
+    reportMedia(detail.url, detail.source || 'page-bridge', {
+      categoryHint: detail.categoryHint || '',
+      contentType: detail.contentType || '',
+    })
   })
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', scanExisting)
+    document.addEventListener('DOMContentLoaded', scanExisting, { once: true })
   } else {
     scanExisting()
   }
@@ -222,43 +119,13 @@
   setTimeout(scanExisting, 2000)
   setTimeout(scanExisting, 5000)
 
-  let dockRoot = null
-  let dockTimer = null
-  let dockActiveTab = 'video'
-  let dockMedia = []
-
-  const DOCK_TAB_ORDER = ['video', 'image', 'audio', 'other']
-  const DOCK_TAB_LABEL = { video: '视频', image: '图片', audio: '音频', other: '其他' }
-
-  function normalizeCategory(m) {
-    const c = String(m.category || '').toLowerCase()
-    if (c === 'audio' || c === 'video' || c === 'image') return c
-    const ct = String(m.contentType || '').toLowerCase()
-    if (ct.startsWith('audio/') || ct.includes('aac') || ct.includes('ogg')) return 'audio'
-    if (ct.startsWith('video/') || ct.includes('mpegurl') || ct.includes('mp2t') || ct.includes('dash+xml')) return 'video'
-    if (ct.startsWith('image/')) return 'image'
-    const u = String(m.url || '')
-    if (AUDIO_EXT_RE.test(u)) return 'audio'
-    if (VIDEO_EXT_RE.test(u)) return 'video'
-    if (IMAGE_EXT_RE.test(u)) return 'image'
-    return 'other'
-  }
-
-  function escHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-  }
-
   function injectDockStyle() {
     if (document.getElementById('media-sniffer-dock-style')) return
     const style = document.createElement('style')
     style.id = 'media-sniffer-dock-style'
     style.textContent = `
-      .ms-dock{position:fixed;top:12px;right:12px;width:380px;max-height:80vh;z-index:2147483647;background:#f7f8fa;border:1px solid #dcdfe6;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.18);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#303133;display:flex;flex-direction:column}
-      .ms-dock-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#409eff;color:#fff;border-radius:8px 8px 0 0}
+      .ms-dock{position:fixed;top:12px;right:12px;width:400px;max-height:80vh;z-index:2147483647;background:#f7f8fa;border:1px solid #dcdfe6;border-radius:10px;box-shadow:0 12px 30px rgba(0,0,0,.2);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#303133;display:flex;flex-direction:column}
+      .ms-dock-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#409eff;color:#fff;border-radius:10px 10px 0 0}
       .ms-dock-title{font-size:13px;font-weight:600}
       .ms-dock-badge{font-size:12px;background:rgba(255,255,255,.25);padding:1px 8px;border-radius:10px}
       .ms-dock-actions{display:flex;gap:6px}
@@ -276,21 +143,34 @@
       .ms-thumb{width:36px;height:36px;object-fit:cover;border:1px solid #dcdfe6;border-radius:4px;cursor:zoom-in;flex-shrink:0;background:#f5f7fa}
       .ms-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
       .ms-meta{font-size:11px;color:#909399;margin-top:4px}
+      .ms-note{margin-top:4px;font-size:11px;color:#e6a23c;line-height:1.4}
       .ms-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600}
       .ms-tag.audio{background:#ecf5ff;color:#409eff}
       .ms-tag.video{background:#fdf6ec;color:#e6a23c}
       .ms-tag.image{background:#f0f9eb;color:#67c23a}
       .ms-tag.other{background:#f4f4f5;color:#909399}
+      .ms-tag.stream{background:#fef0f0;color:#f56c6c}
       .ms-download{border:none;background:#409eff;color:#fff;border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer}
       .ms-empty{text-align:center;color:#909399;font-size:12px;padding:20px 0}
     `
     document.documentElement.appendChild(style)
   }
 
+  function getStreamTag(item) {
+    const mode = Shared.getDownloadMode(item)
+    if (mode === 'manifest') return '<span class="ms-tag stream">索引</span>'
+    if (mode === 'segment') return '<span class="ms-tag stream">分片</span>'
+    return ''
+  }
+
+  function findDockItem(itemId) {
+    return dockMedia.find((item) => item.id === itemId) || null
+  }
+
   function ensureDock() {
-    if (dockRoot) return
-    if (window.top !== window) return
+    if (dockRoot || window.top !== window) return
     injectDockStyle()
+
     const root = document.createElement('div')
     root.className = 'ms-dock'
     root.innerHTML = `
@@ -311,45 +191,49 @@
     document.documentElement.appendChild(root)
     dockRoot = root
 
-    root.querySelector('#msDockClose').addEventListener('click', () => {
-      destroyDock()
-    })
+    root.querySelector('#msDockClose').addEventListener('click', destroyDock)
     root.querySelector('#msDockClear').addEventListener('click', () => {
-      chrome.runtime.sendMessage({ type: 'clearMediaForTab' }, () => refreshDockData())
+      chrome.runtime.sendMessage({ type: Shared.MESSAGE_TYPES.CLEAR_MEDIA_FOR_TAB }, () => refreshDockData())
     })
-    root.addEventListener('click', (e) => {
-      const tabBtn = e.target.closest('.ms-tab')
-      if (tabBtn) {
-        if (tabBtn.disabled) return
-        dockActiveTab = tabBtn.dataset.cat
+    root.addEventListener('click', (event) => {
+      const tabButton = event.target.closest('.ms-tab')
+      if (tabButton) {
+        if (tabButton.disabled) return
+        dockActiveTab = tabButton.dataset.cat
         renderDock()
         return
       }
-      const thumb = e.target.closest('.ms-thumb')
-      if (thumb) {
-        const url = thumb.dataset.url
-        if (url) window.open(url, '_blank', 'noopener,noreferrer')
+
+      const thumb = event.target.closest('.ms-thumb')
+      if (thumb?.dataset.url) {
+        window.open(thumb.dataset.url, '_blank', 'noopener,noreferrer')
         return
       }
-      const dlBtn = e.target.closest('.ms-download')
-      if (!dlBtn) return
-      const idx = parseInt(dlBtn.dataset.idx, 10)
-      const item = dockMedia[idx]
+
+      const downloadButton = event.target.closest('.ms-download')
+      if (!downloadButton) return
+      const item = findDockItem(downloadButton.dataset.id)
       if (!item) return
-      dlBtn.textContent = '下载中'
+
+      downloadButton.textContent = '下载中'
       chrome.runtime.sendMessage(
         {
-          type: 'download',
+          type: Shared.MESSAGE_TYPES.DOWNLOAD,
+          tabId: item.tabId,
+          frameId: item.frameId,
           url: item.url,
           filename: item.filename,
-          category: normalizeCategory(item),
+          category: Shared.normalizeCategory(item),
           contentType: item.contentType,
           referer: item.referer,
+          sizeBytes: item.sizeBytes,
         },
         (resp) => {
-          dlBtn.textContent = resp?.ok ? '完成' : '失败'
+          downloadButton.textContent = resp?.ok ? '完成' : '失败'
+          if (resp?.warning) downloadButton.title = resp.warning
           setTimeout(() => {
-            dlBtn.textContent = '下载'
+            downloadButton.textContent = '下载'
+            downloadButton.title = ''
           }, 1200)
         }
       )
@@ -357,10 +241,6 @@
   }
 
   function destroyDock() {
-    if (dockTimer) {
-      clearInterval(dockTimer)
-      dockTimer = null
-    }
     if (dockRoot) {
       dockRoot.remove()
       dockRoot = null
@@ -370,55 +250,62 @@
   function renderDock() {
     if (!dockRoot) return
     const counts = { video: 0, image: 0, audio: 0, other: 0 }
-    dockMedia.forEach((m) => {
-      counts[normalizeCategory(m)] += 1
+    dockMedia.forEach((item) => {
+      counts[Shared.normalizeCategory(item)] += 1
     })
-    if (counts[dockActiveTab] === 0) {
-      dockActiveTab = DOCK_TAB_ORDER.find((k) => counts[k] > 0) || 'video'
+
+    if (!counts[dockActiveTab]) {
+      dockActiveTab = DOCK_TAB_ORDER.find((key) => counts[key] > 0) || 'video'
     }
 
-    const tabsEl = dockRoot.querySelector('#msDockTabs')
-    const listEl = dockRoot.querySelector('#msDockList')
-    const countEl = dockRoot.querySelector('#msDockCount')
-    countEl.textContent = `${dockMedia.length} 个`
-    tabsEl.innerHTML = DOCK_TAB_ORDER.map((k) => {
-      const activeClass = k === dockActiveTab ? 'active' : ''
-      const disabled = (counts[k] || 0) === 0 ? 'disabled' : ''
-      return `<button class="ms-tab ${activeClass}" data-cat="${k}" ${disabled}>${DOCK_TAB_LABEL[k]} (${counts[k] || 0})</button>`
+    dockRoot.querySelector('#msDockCount').textContent = `${dockMedia.length} 个`
+    dockRoot.querySelector('#msDockTabs').innerHTML = DOCK_TAB_ORDER.map((key) => {
+      const activeClass = key === dockActiveTab ? 'active' : ''
+      const disabled = counts[key] ? '' : 'disabled'
+      return `<button class="ms-tab ${activeClass}" data-cat="${key}" ${disabled}>${DOCK_TAB_LABEL[key]} (${counts[key] || 0})</button>`
     }).join('')
 
     const list = dockMedia
-      .map((m, idx) => ({ ...m, _idx: idx, _category: normalizeCategory(m) }))
-      .filter((m) => m._category === dockActiveTab)
-      .sort((a, b) => (b.time || 0) - (a.time || 0))
+      .filter((item) => Shared.normalizeCategory(item) === dockActiveTab)
+      .sort((left, right) => (right.time || 0) - (left.time || 0))
+
+    const listEl = dockRoot.querySelector('#msDockList')
     if (!list.length) {
       listEl.innerHTML = '<div class="ms-empty">当前分类暂无资源</div>'
       return
     }
-    listEl.innerHTML = list.map((m) => {
-      const sizeInfo = m.size ? `${escHtml(m.size)} ` : ''
-      const typeInfo = m.contentType ? escHtml(m.contentType) : ''
-      const platformInfo = m.platform ? ` ${escHtml(m.platform)}` : ''
-      const timeStr = m.time ? new Date(m.time).toLocaleTimeString() : ''
-      const previewHtml = m._category === 'image'
-        ? `<img class="ms-thumb" data-url="${escHtml(m.url || '')}" src="${escHtml(m.url || '')}" alt="img" />`
+
+    listEl.innerHTML = list.map((item) => {
+      const category = Shared.normalizeCategory(item)
+      const previewHtml = category === 'image'
+        ? `<img class="ms-thumb" data-url="${Shared.escapeHtml(item.url || '')}" src="${Shared.escapeHtml(item.url || '')}" alt="img" />`
         : ''
+      const meta = [
+        item.size ? Shared.escapeHtml(item.size) : '',
+        item.contentType ? Shared.escapeHtml(item.contentType) : '',
+        item.platform ? Shared.escapeHtml(item.platform) : '',
+        item.time ? Shared.escapeHtml(new Date(item.time).toLocaleTimeString()) : '',
+      ].filter(Boolean).join(' ')
+      const note = item.downloadNotice ? `<div class="ms-note">${Shared.escapeHtml(item.downloadNotice)}</div>` : ''
+
       return `<div class="ms-item">
         <div class="ms-row">
-          <span class="ms-tag ${m._category}">${DOCK_TAB_LABEL[m._category]}</span>
+          <span class="ms-tag ${category}">${DOCK_TAB_LABEL[category]}</span>
+          ${getStreamTag(item)}
           ${previewHtml}
-          <span class="ms-name" title="${escHtml(m.filename || 'media')}">${escHtml(m.filename || 'media')}</span>
-          <button class="ms-download" data-idx="${m._idx}">下载</button>
+          <span class="ms-name" title="${Shared.escapeHtml(item.filename || 'media')}">${Shared.escapeHtml(item.filename || 'media')}</span>
+          <button class="ms-download" data-id="${Shared.escapeHtml(item.id)}">下载</button>
         </div>
-        <div class="ms-meta">${sizeInfo}${typeInfo}${platformInfo} ${escHtml(timeStr)}</div>
+        <div class="ms-meta">${meta}</div>
+        ${note}
       </div>`
     }).join('')
   }
 
   function refreshDockData() {
-    chrome.runtime.sendMessage({ type: 'getMediaForTab' }, (resp) => {
+    chrome.runtime.sendMessage({ type: Shared.MESSAGE_TYPES.GET_MEDIA_FOR_TAB }, (resp) => {
       if (!dockRoot || !resp) return
-      dockMedia = resp.media || []
+      dockMedia = (resp.media || []).map((item) => ({ ...item, tabId: resp.tabId }))
       const siteEl = dockRoot.querySelector('#msDockSite')
       try {
         siteEl.textContent = resp.tabUrl ? new URL(resp.tabUrl).hostname : '当前页面'
@@ -437,35 +324,20 @@
     }
     ensureDock()
     refreshDockData()
-    dockTimer = setInterval(refreshDockData, 2000)
   }
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.type === 'toggleDockPanel') {
-      toggleDockPanel()
-      sendResponse({ ok: true })
-      return true
-    }
-    if (msg.type !== 'fetchBlob') return false
+  function fetchBlobAsDataUrl(url) {
+    const credentialModes = Shared.isBlobUrl(url) ? ['same-origin'] : ['omit', 'include', 'same-origin']
 
-    const url = msg.url
-    fetch(url, { credentials: 'omit' })
-      .then((resp) => {
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-        return resp.blob()
-      })
-      .catch(() => {
-        return fetch(url, { credentials: 'include' }).then((resp) => {
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-          return resp.blob()
+    return credentialModes
+      .reduce((promise, credentials) => {
+        return promise.catch(() => {
+          return fetch(url, { credentials }).then((resp) => {
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+            return resp.blob()
+          })
         })
-      })
-      .catch(() => {
-        return fetch(url, { credentials: 'same-origin' }).then((resp) => {
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-          return resp.blob()
-        })
-      })
+      }, Promise.reject(new Error('init')))
       .then((blob) => {
         return new Promise((resolve, reject) => {
           const reader = new FileReader()
@@ -474,6 +346,52 @@
           reader.readAsDataURL(blob)
         })
       })
+  }
+
+  function fetchTextResource(url) {
+    const credentialModes = Shared.isBlobUrl(url) ? ['same-origin'] : ['omit', 'include', 'same-origin']
+
+    return credentialModes
+      .reduce((promise, credentials) => {
+        return promise.catch(() => {
+          return fetch(url, { credentials }).then((resp) => {
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+            return resp.text().then((text) => ({
+              text,
+              finalUrl: resp.url || url,
+            }))
+          })
+        })
+      }, Promise.reject(new Error('init')))
+  }
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === Shared.MESSAGE_TYPES.TOGGLE_DOCK_PANEL) {
+      toggleDockPanel()
+      sendResponse({ ok: true })
+      return true
+    }
+
+    if (msg.type === Shared.MESSAGE_TYPES.MEDIA_UPDATED) {
+      if (dockRoot) refreshDockData()
+      return false
+    }
+
+    if (msg.type === Shared.MESSAGE_TYPES.FETCH_TEXT) {
+      fetchTextResource(msg.url)
+        .then((result) => {
+          sendResponse({ ok: true, text: result.text, finalUrl: result.finalUrl })
+        })
+        .catch((err) => {
+          console.error('[Media Sniffer] in-page text fetch failed:', err)
+          sendResponse({ ok: false, error: err.message })
+        })
+      return true
+    }
+
+    if (msg.type !== Shared.MESSAGE_TYPES.FETCH_BLOB) return false
+
+    fetchBlobAsDataUrl(msg.url)
       .then((dataUrl) => {
         sendResponse({ ok: true, dataUrl })
       })

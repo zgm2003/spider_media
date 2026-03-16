@@ -1,0 +1,86 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box }
+body { width: 420px; min-height: 300px; font-family: -apple-system, 'Microsoft YaHei', sans-serif; background: #f7f8fa; color: #333 }
+
+.header { padding: 12px 16px; background: #409eff; color: #fff; display: flex; align-items: center; justify-content: space-between }
+.header h1 { font-size: 15px; font-weight: 600 }
+.header .badge { background: rgba(255,255,255,0.25); padding: 2px 8px; border-radius: 10px; font-size: 12px }
+
+.panel { padding: 12px 16px }
+.media-list { max-height: 420px; overflow-y: auto }
+.media-item { background: #fff; border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px }
+.media-item .row { display: flex; align-items: center; justify-content: space-between; gap: 8px }
+.media-item .filename { font-size: 13px; font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.media-item .meta { font-size: 11px; color: #909399; margin-top: 4px }
+.media-item .meta span { margin-right: 10px }
+.thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 4px; border: 1px solid #dcdfe6; cursor: zoom-in; flex-shrink: 0; background: #f5f7fa }
+.tabs { display: flex; gap: 6px; margin-bottom: 10px; overflow-x: auto; padding-bottom: 2px }
+.tab-btn { border: 1px solid #dcdfe6; background: #fff; color: #606266; border-radius: 14px; font-size: 12px; padding: 3px 10px; cursor: pointer; white-space: nowrap }
+.tab-btn.active { background: #409eff; border-color: #409eff; color: #fff }
+.tab-btn:disabled { background: #f5f7fa; color: #c0c4cc; border-color: #ebeef5; cursor: not-allowed }
+
+.tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 500 }
+.tag.audio { background: #ecf5ff; color: #409eff }
+.tag.video { background: #fdf6ec; color: #e6a23c }
+.tag.image { background: #f0f9eb; color: #67c23a }
+.tag.other { background: #f4f4f5; color: #909399 }
+
+.btn-sm { padding: 4px 10px; font-size: 11px; background: #f0f2f5; border: 1px solid #dcdfe6; border-radius: 4px; cursor: pointer; color: #606266 }
+.btn-sm:hover { background: #e4e7ed }
+.btn-dl { padding: 4px 12px; font-size: 12px; background: #409eff; color: #fff; border: none; border-radius: 4px; cursor: pointer; white-space: nowrap }
+.btn-dl:hover { background: #337ecc }
+.empty { text-align: center; padding: 40px 0; color: #909399; font-size: 13px }
+.btn-icon { width: 26px; height: 26px; padding: 0; border-radius: 50%; font-size: 14px; line-height: 24px; text-align: center }
+.settings { display: none; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap }
+.settings.show { display: flex }
+.settings-label { font-size: 12px; color: #606266; font-weight: 600 }
+.sw { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #606266; background: #fff; border: 1px solid #e4e7ed; padding: 3px 8px; border-radius: 12px }
+.sw input { margin: 0 }
+.preview-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 9999; padding: 20px }
+.preview-mask.show { display: flex }
+.preview-img { max-width: min(90vw, 980px); max-height: 85vh; border-radius: 8px; background: #fff; box-shadow: 0 10px 30px rgba(0,0,0,.35) }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>媒体嗅探器</h1>
+  <span class="badge" id="countBadge">0 个资源</span>
+</div>
+
+<div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <span style="font-size:12px;color:#909399" id="pageUrl">当前页面</span>
+    <div style="display:flex;gap:6px">
+      <button class="btn-sm btn-icon" id="btnSettings" title="抓取设置">⚙</button>
+      <button class="btn-sm" id="btnPin" title="固定到页面右上角">📌钉住</button>
+      <button class="btn-sm" id="btnClear" title="清空嗅探结果">清空</button>
+    </div>
+  </div>
+
+  <div class="settings" id="settingsPanel">
+    <span class="settings-label">抓取：</span>
+    <label class="sw"><input type="checkbox" id="setVideo" checked />视频</label>
+    <label class="sw"><input type="checkbox" id="setImage" checked />图片</label>
+    <label class="sw"><input type="checkbox" id="setAudio" checked />音频</label>
+    <label class="sw"><input type="checkbox" id="setOther" checked />其他</label>
+  </div>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="media-list" id="mediaList"></div>
+
+  <div class="empty" id="emptyTip">
+    <p>暂未嗅探到媒体资源</p>
+    <p style="font-size:11px;color:#c0c4cc;margin-top:4px">打开含音频、视频或图片的页面后会自动出现</p>
+  </div>
+</div>
+
+<div class="preview-mask" id="imgPreviewMask">
+  <img class="preview-img" id="imgPreview" alt="preview" />
+</div>
+<script src="popup.js"></script>
+</body>
+</html>

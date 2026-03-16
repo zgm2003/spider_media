@@ -220,6 +220,7 @@
         {
           type: Shared.MESSAGE_TYPES.DOWNLOAD,
           tabId: item.tabId,
+          key: item.key || '',
           frameId: item.frameId,
           url: item.url,
           filename: item.filename,
@@ -227,6 +228,8 @@
           contentType: item.contentType,
           referer: item.referer,
           sizeBytes: item.sizeBytes,
+          requestHeaders: item.requestHeaders || {},
+          responseHeaders: item.responseHeaders || {},
         },
         (resp) => {
           downloadButton.textContent = resp?.ok ? '完成' : '失败'

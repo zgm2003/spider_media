@@ -11,8 +11,9 @@ let normalizedMedia = []
 let captureSettings = { ...Shared.DEFAULT_CAPTURE_SETTINGS }
 let currentTabId = null
 
-const streamContextById = new Map()
-const pendingStreamIds = new Set()
+const streamContextByKey = new Map()
+const pendingStreamKeys = new Set()
+const expandedKeys = new Set()
 
 const mediaListEl = document.getElementById('mediaList')
 const emptyTip = document.getElementById('emptyTip')
@@ -37,6 +38,14 @@ const TAB_LABEL = {
   other: '其他',
 }
 
+const STATUS_LABEL = {
+  discovered: '已发现',
+  analyzed: '已分析',
+  exported: '已导出',
+  downloaded: '已下载',
+  failed: '失败',
+}
+
 function typeLabel(category) {
   if (category === 'video') return '<span class="tag video">视频</span>'
   if (category === 'audio') return '<span class="tag audio">音频</span>'
@@ -51,8 +60,23 @@ function streamLabel(item) {
   return ''
 }
 
+function statusLabel(item) {
+  const status = item.status || 'discovered'
+  if (status === 'discovered') return ''
+  const text = STATUS_LABEL[status] || status
+  return `<span class="tag status ${Shared.escapeHtml(status)}">${Shared.escapeHtml(text)}</span>`
+}
+
 function isManifestItem(item) {
   return Shared.getDownloadMode(item) === 'manifest'
+}
+
+function getItemKey(item) {
+  return item.key || item.id || ''
+}
+
+function findMediaByKey(key) {
+  return currentMedia.find((item) => getItemKey(item) === key) || null
 }
 
 function findMediaById(itemId) {
@@ -74,12 +98,15 @@ function setStatusNote(text, tone) {
 }
 
 function pruneStreamContextCache() {
-  const validIds = new Set(currentMedia.map((item) => item.id))
-  for (const itemId of Array.from(streamContextById.keys())) {
-    if (!validIds.has(itemId)) streamContextById.delete(itemId)
+  const validKeys = new Set(currentMedia.map((item) => getItemKey(item)))
+  for (const key of Array.from(streamContextByKey.keys())) {
+    if (!validKeys.has(key)) streamContextByKey.delete(key)
   }
-  for (const itemId of Array.from(pendingStreamIds)) {
-    if (!validIds.has(itemId)) pendingStreamIds.delete(itemId)
+  for (const key of Array.from(pendingStreamKeys)) {
+    if (!validKeys.has(key)) pendingStreamKeys.delete(key)
+  }
+  for (const key of Array.from(expandedKeys)) {
+    if (!validKeys.has(key)) expandedKeys.delete(key)
   }
 }
 
@@ -107,32 +134,230 @@ function renderTabs(counts) {
   }).join('')
 }
 
+function formatHeadersDisplay(headers) {
+  if (!headers || typeof headers !== 'object') return ''
+  const entries = Object.entries(headers).filter(([, v]) => v)
+  if (!entries.length) return ''
+  return entries.map(([k, v]) => `${Shared.escapeHtml(k)}: ${Shared.escapeHtml(v)}`).join('\n')
+}
+
+function getContextNoteHtml(item) {
+  const notes = []
+  if (item.hasCookieHeader) {
+    notes.push('请求中包含 Cookie，离站复现时可能需要手动添加。')
+  }
+  if (item.hasAuthorizationHeader) {
+    notes.push('请求中包含鉴权头，离站复现时可能需要手动添加。')
+  }
+  if (!notes.length) return ''
+  return notes.map((n) => `<div class="context-note">${Shared.escapeHtml(n)}</div>`).join('')
+}
+
+function getHlsAnalysisHtml(analysis) {
+  if (!analysis || analysis.kind !== 'hls') return ''
+
+  const sections = []
+
+  if (analysis.variants && analysis.variants.length) {
+    const rows = analysis.variants.map((v) => {
+      const parts = [v.resolution || '', v.bandwidth ? `${Math.round(v.bandwidth / 1000)} kbps` : '', v.codecs || ''].filter(Boolean)
+      return `<div class="analysis-item">
+        <div class="analysis-main">${Shared.escapeHtml(v.type === 'iframe' ? '[I-Frame]' : '')} ${Shared.escapeHtml(parts.join(' | ') || v.url || '未知')}</div>
+        ${v.url ? `<div class="analysis-sub">${Shared.escapeHtml(v.url)}</div>` : ''}
+      </div>`
+    }).join('')
+    sections.push(`<div class="analysis-card"><div class="analysis-title">变体 (${analysis.variants.length})</div>${rows}</div>`)
+  }
+
+  if (analysis.mediaTracks && analysis.mediaTracks.length) {
+    const rows = analysis.mediaTracks.map((t) => {
+      const parts = [t.type || '', t.name || '', t.language || '', t.groupId ? `group: ${t.groupId}` : ''].filter(Boolean)
+      return `<div class="analysis-item">
+        <div class="analysis-main">${Shared.escapeHtml(parts.join(' | '))}</div>
+        ${t.uri ? `<div class="analysis-sub">${Shared.escapeHtml(t.uri)}</div>` : ''}
+      </div>`
+    }).join('')
+    sections.push(`<div class="analysis-card"><div class="analysis-title">媒体轨道 (${analysis.mediaTracks.length})</div>${rows}</div>`)
+  }
+
+  const info = []
+  if (analysis.encryptionMethod) info.push(`加密: ${analysis.encryptionMethod}`)
+  if (analysis.totalDurationSeconds) info.push(`估算时长: ${analysis.durationLabel || analysis.totalDurationSeconds + 's'}`)
+  if (analysis.targetDuration) info.push(`分片目标时长: ${analysis.targetDuration}s`)
+  if (analysis.segmentCount) info.push(`分片数: ${analysis.segmentCount}`)
+  if (analysis.playlistType) info.push(`类型: ${analysis.playlistType}`)
+
+  if (info.length) {
+    const rows = info.map((i) => `<div class="analysis-item"><div class="analysis-main">${Shared.escapeHtml(i)}</div></div>`).join('')
+    sections.push(`<div class="analysis-card"><div class="analysis-title">基本信息</div>${rows}</div>`)
+  }
+
+  return sections.length ? `<div class="analysis-panel">${sections.join('')}</div>` : ''
+}
+
+function getDashAnalysisHtml(analysis) {
+  if (!analysis || analysis.kind !== 'dash') return ''
+
+  const sections = []
+
+  if (analysis.adaptationSets && analysis.adaptationSets.length) {
+    const cards = analysis.adaptationSets.map((as) => {
+      const typeLabel = as.type === 'video' ? '视频' : as.type === 'audio' ? '音频' : as.type === 'subtitle' ? '字幕' : as.type || '未知'
+      const langPart = as.language ? ` (${as.language})` : ''
+
+      const repRows = (as.representations || []).map((r) => {
+        const parts = []
+        if (r.width && r.height) parts.push(`${r.width}x${r.height}`)
+        if (r.bandwidth) parts.push(`${Math.round(r.bandwidth / 1000)} kbps`)
+        if (r.codecs) parts.push(r.codecs)
+        return `<div class="analysis-item"><div class="analysis-main">${Shared.escapeHtml(parts.join(' | ') || r.id || '未知')}</div></div>`
+      }).join('')
+
+      return `<div class="analysis-card">
+        <div class="analysis-title">${Shared.escapeHtml(typeLabel)}${Shared.escapeHtml(langPart)} — ${as.representations?.length || 0} 个表示层</div>
+        ${repRows || '<div class="analysis-empty">无表示层信息</div>'}
+      </div>`
+    }).join('')
+    sections.push(cards)
+  }
+
+  const info = []
+  if (analysis.durationLabel) info.push(`时长: ${analysis.durationLabel}`)
+  if (analysis.encrypted) info.push('包含 DRM 内容保护')
+  if (analysis.isLive) info.push('直播流')
+  if (analysis.segmentTemplateCount) info.push(`SegmentTemplate: ${analysis.segmentTemplateCount}`)
+  if (analysis.segmentTimelineEntryCount) info.push(`时间线条目: ${analysis.segmentTimelineEntryCount}`)
+
+  if (info.length) {
+    const rows = info.map((i) => `<div class="analysis-item"><div class="analysis-main">${Shared.escapeHtml(i)}</div></div>`).join('')
+    sections.push(`<div class="analysis-card"><div class="analysis-title">基本信息</div>${rows}</div>`)
+  }
+
+  return sections.length ? `<div class="analysis-panel">${sections.join('')}</div>` : ''
+}
+
 function getContextSummaryHtml(item) {
-  const context = streamContextById.get(item.id)
+  const key = getItemKey(item)
+  const context = streamContextByKey.get(key)
   if (!context) return ''
 
+  const analysis = context.analysis || {}
+  const analysisHtml = analysis.kind === 'hls' ? getHlsAnalysisHtml(analysis) : getDashAnalysisHtml(analysis)
+
+  const summaryLine = context.summary
+    ? `<div class="stream-title">${Shared.escapeHtml(context.summary)}</div>`
+    : '<div class="stream-title">流媒体分析已就绪</div>'
+
   const detailHtml = (context.details || [])
-    .slice(0, 4)
+    .slice(0, 6)
     .map((detail) => `<div>${Shared.escapeHtml(detail)}</div>`)
     .join('')
 
   return `<div class="stream-summary">
-    <div class="stream-title">${Shared.escapeHtml(context.summary || '流媒体分析已就绪')}</div>
+    ${summaryLine}
     ${detailHtml}
-  </div>`
+  </div>
+  ${analysisHtml}`
 }
 
 function getStreamToolsHtml(item) {
   if (!isManifestItem(item)) return ''
 
-  const isPending = pendingStreamIds.has(item.id)
-  const analyzeLabel = isPending ? '分析中...' : streamContextById.has(item.id) ? '刷新分析' : '分析'
-  const copyLabel = isPending ? '处理中...' : '复制 ffmpeg'
+  const key = getItemKey(item)
+  const isPending = pendingStreamKeys.has(key)
+  const hasContext = streamContextByKey.has(key)
+  const analyzeLabel = isPending ? '分析中...' : hasContext ? '刷新分析' : '分析'
   const disabled = isPending ? 'disabled' : ''
 
+  const copyButtons = hasContext
+    ? `<button class="btn-alt js-stream-action" data-action="copy-ffmpeg" data-key="${Shared.escapeHtml(key)}" ${disabled}>ffmpeg</button>
+       <button class="btn-alt js-stream-action" data-action="copy-ytdlp" data-key="${Shared.escapeHtml(key)}" ${disabled}>yt-dlp</button>
+       <button class="btn-alt js-stream-action" data-action="copy-curl" data-key="${Shared.escapeHtml(key)}" ${disabled}>curl</button>
+       <button class="btn-alt js-stream-action" data-action="export-json" data-key="${Shared.escapeHtml(key)}" ${disabled}>导出 JSON</button>`
+    : `<button class="btn-alt js-stream-action" data-action="copy-ffmpeg" data-key="${Shared.escapeHtml(key)}" ${disabled}>复制 ffmpeg</button>`
+
   return `<div class="stream-tools">
-    <button class="btn-alt js-stream-action" data-action="analyze" data-id="${Shared.escapeHtml(item.id)}" ${disabled}>${analyzeLabel}</button>
-    <button class="btn-alt js-stream-action" data-action="copy-command" data-id="${Shared.escapeHtml(item.id)}" ${disabled}>${copyLabel}</button>
+    <button class="btn-alt js-stream-action" data-action="analyze" data-key="${Shared.escapeHtml(key)}" ${disabled}>${analyzeLabel}</button>
+    ${copyButtons}
+  </div>`
+}
+
+function getDetailsPanelHtml(item) {
+  const key = getItemKey(item)
+  if (!expandedKeys.has(key)) return ''
+
+  const fields = []
+
+  fields.push({ label: '完整 URL', value: item.url || '', wide: true, mono: true })
+
+  if (item.finalUrl && item.finalUrl !== item.url) {
+    fields.push({ label: '最终地址', value: item.finalUrl, wide: true, mono: true })
+  }
+
+  const sourceList = item.sourceList && item.sourceList.length ? item.sourceList.join(', ') : item.source || 'unknown'
+  fields.push({ label: '来源链路', value: sourceList })
+  fields.push({ label: 'Referer', value: item.referer || '(无)' })
+
+  if (item.refererOrigin) {
+    fields.push({ label: 'Referer Origin', value: item.refererOrigin })
+  }
+
+  if (Number.isInteger(item.frameId)) {
+    fields.push({ label: 'Frame ID', value: item.frameId === 0 ? '0 (主框架)' : String(item.frameId) })
+  }
+
+  if (item.method) {
+    fields.push({ label: '请求方法', value: item.method })
+  }
+
+  if (item.initiator) {
+    fields.push({ label: 'Initiator', value: item.initiator })
+  }
+
+  if (item.fromCache) {
+    fields.push({ label: '缓存', value: '来自缓存' })
+  }
+
+  if (item.contentType) {
+    fields.push({ label: 'Content-Type', value: item.contentType })
+  }
+
+  if (item.size) {
+    fields.push({ label: '大小', value: item.size })
+  }
+
+  if (item.time) {
+    fields.push({ label: '发现时间', value: new Date(item.time).toLocaleString() })
+  }
+
+  const reqHeaders = formatHeadersDisplay(item.requestHeaders)
+  if (reqHeaders) {
+    fields.push({ label: '请求头', value: reqHeaders, wide: true, mono: true })
+  }
+
+  const respHeaders = formatHeadersDisplay(item.responseHeaders)
+  if (respHeaders) {
+    fields.push({ label: '响应头', value: respHeaders, wide: true, mono: true })
+  }
+
+  const gridHtml = fields.map((f) => {
+    const wideClass = f.wide ? ' wide' : ''
+    const monoClass = f.mono ? ' mono' : ''
+    return `<div class="detail-field${wideClass}">
+      <div class="detail-label">${Shared.escapeHtml(f.label)}</div>
+      <div class="detail-value${monoClass}">${Shared.escapeHtml(f.value)}</div>
+    </div>`
+  }).join('')
+
+  const copyUrlBtn = `<button class="btn-alt js-detail-action" data-action="copy-url" data-key="${Shared.escapeHtml(key)}">复制 URL</button>`
+  const copyRefererBtn = item.referer ? `<button class="btn-alt js-detail-action" data-action="copy-referer" data-key="${Shared.escapeHtml(key)}">复制 Referer</button>` : ''
+
+  return `<div class="details-panel">
+    <div class="detail-actions">
+      ${copyUrlBtn}
+      ${copyRefererBtn}
+    </div>
+    <div class="detail-grid">${gridHtml}</div>
   </div>`
 }
 
@@ -150,29 +375,39 @@ function renderActiveList() {
   emptyTip.style.display = 'none'
 
   mediaListEl.innerHTML = list.map((item) => {
+    const key = getItemKey(item)
+    const isExpanded = expandedKeys.has(key)
+    const expandedClass = isExpanded ? ' expanded' : ''
+
     const previewHtml = item._category === 'image'
       ? `<img class="thumb js-thumb" data-url="${Shared.escapeHtml(item.url || '')}" src="${Shared.escapeHtml(item.url || '')}" alt="preview" />`
       : ''
     const meta = [
       item.size ? `<span>${Shared.escapeHtml(item.size)}</span>` : '',
       item.contentType ? `<span>${Shared.escapeHtml(item.contentType)}</span>` : '',
-      item.platform ? `<span>${Shared.escapeHtml(item.platform)}</span>` : '',
+      item.source ? `<span>${Shared.escapeHtml(item.source)}</span>` : '',
       item.time ? `<span>${Shared.escapeHtml(new Date(item.time).toLocaleTimeString())}</span>` : '',
     ].filter(Boolean).join('')
     const note = item.downloadNotice ? `<div class="note">${Shared.escapeHtml(item.downloadNotice)}</div>` : ''
 
-    return `<div class="media-item">
+    return `<div class="media-item${expandedClass}" data-key="${Shared.escapeHtml(key)}">
       <div class="row">
         ${typeLabel(item._category)}
         ${streamLabel(item)}
+        ${statusLabel(item)}
         ${previewHtml}
         <span class="filename" title="${Shared.escapeHtml(item.filename || 'media')}">${Shared.escapeHtml(item.filename || 'media')}</span>
-        <button class="btn-dl" data-id="${Shared.escapeHtml(item.id)}">下载</button>
+        <div class="row-actions">
+          <button class="btn-alt js-expand" data-key="${Shared.escapeHtml(key)}">${isExpanded ? '收起' : '详情'}</button>
+          <button class="btn-dl" data-id="${Shared.escapeHtml(item.id)}" data-key="${Shared.escapeHtml(key)}">下载</button>
+        </div>
       </div>
       <div class="meta">${meta}</div>
       ${note}
+      ${getContextNoteHtml(item)}
       ${getStreamToolsHtml(item)}
       ${getContextSummaryHtml(item)}
+      ${getDetailsPanelHtml(item)}
     </div>`
   }).join('')
 }
@@ -225,8 +460,7 @@ function loadSniffData() {
   })
 }
 
-function downloadMedia(itemId, buttonEl) {
-  const item = findMediaById(itemId)
+function downloadMedia(item, buttonEl) {
   if (!item || !buttonEl) return
 
   buttonEl.textContent = '下载中...'
@@ -234,6 +468,7 @@ function downloadMedia(itemId, buttonEl) {
     {
       type: Shared.MESSAGE_TYPES.DOWNLOAD,
       tabId: currentTabId,
+      key: getItemKey(item),
       frameId: item.frameId,
       url: item.url,
       filename: item.filename,
@@ -241,6 +476,8 @@ function downloadMedia(itemId, buttonEl) {
       contentType: item.contentType,
       referer: item.referer,
       sizeBytes: item.sizeBytes,
+      requestHeaders: item.requestHeaders || {},
+      responseHeaders: item.responseHeaders || {},
     },
     (resp) => {
       if (resp?.warning) setStatusNote(resp.warning, 'warn')
@@ -263,14 +500,16 @@ function downloadMedia(itemId, buttonEl) {
 }
 
 function requestStreamContext(item, forceRefresh) {
+  const key = getItemKey(item)
   return new Promise((resolve) => {
-    pendingStreamIds.add(item.id)
+    pendingStreamKeys.add(key)
     renderActiveList()
 
     chrome.runtime.sendMessage(
       {
         type: Shared.MESSAGE_TYPES.GET_STREAM_CONTEXT,
         tabId: currentTabId,
+        key: key,
         frameId: item.frameId,
         url: item.url,
         filename: item.filename,
@@ -278,12 +517,15 @@ function requestStreamContext(item, forceRefresh) {
         categoryHint: item.categoryHint,
         contentType: item.contentType,
         referer: item.referer,
+        requestHeaders: item.requestHeaders || {},
+        responseHeaders: item.responseHeaders || {},
+        status: item.status || 'discovered',
         force: !!forceRefresh,
       },
       (resp) => {
-        pendingStreamIds.delete(item.id)
+        pendingStreamKeys.delete(key)
         if (resp?.ok && resp.context) {
-          streamContextById.set(item.id, resp.context)
+          streamContextByKey.set(key, resp.context)
           setStatusNote('流媒体索引分析完成。', 'success')
           renderActiveList()
           resolve(resp.context)
@@ -318,8 +560,17 @@ async function copyText(text) {
   }
 }
 
-async function handleStreamAction(itemId, action) {
-  const item = findMediaById(itemId)
+async function ensureStreamContext(item) {
+  const key = getItemKey(item)
+  let context = streamContextByKey.get(key)
+  if (!context) {
+    context = await requestStreamContext(item, false)
+  }
+  return context
+}
+
+async function handleStreamAction(key, action) {
+  const item = findMediaByKey(key)
   if (!item || !isManifestItem(item)) return
 
   if (action === 'analyze') {
@@ -327,21 +578,91 @@ async function handleStreamAction(itemId, action) {
     return
   }
 
-  let context = streamContextById.get(item.id)
+  const context = await ensureStreamContext(item)
   if (!context) {
-    context = await requestStreamContext(item, false)
-  }
-
-  if (!context?.command) {
-    setStatusNote('这个资源暂时无法生成 ffmpeg 命令。', 'error')
+    setStatusNote('流媒体分析失败，无法生成命令。', 'error')
     return
   }
 
-  const copied = await copyText(context.command)
-  setStatusNote(
-    copied ? 'ffmpeg 命令已复制到剪贴板。' : '复制失败，浏览器拒绝了剪贴板权限。',
-    copied ? 'success' : 'error'
-  )
+  const commands = context.exports?.commands || {}
+
+  if (action === 'copy-ffmpeg' || action === 'copy-command') {
+    const text = commands.ffmpeg || context.command || ''
+    if (!text) {
+      setStatusNote('无法生成 ffmpeg 命令。', 'error')
+      return
+    }
+    const ok = await copyText(text)
+    setStatusNote(ok ? 'ffmpeg 命令已复制到剪贴板。' : '复制失败。', ok ? 'success' : 'error')
+    return
+  }
+
+  if (action === 'copy-ytdlp') {
+    const text = commands.ytDlp || ''
+    if (!text) {
+      setStatusNote('无法生成 yt-dlp 命令。', 'error')
+      return
+    }
+    const ok = await copyText(text)
+    setStatusNote(ok ? 'yt-dlp 命令已复制到剪贴板。' : '复制失败。', ok ? 'success' : 'error')
+    return
+  }
+
+  if (action === 'copy-curl') {
+    const text = commands.curl || ''
+    if (!text) {
+      setStatusNote('无法生成 curl 命令。', 'error')
+      return
+    }
+    const ok = await copyText(text)
+    setStatusNote(ok ? 'curl 命令已复制到剪贴板。' : '复制失败。', ok ? 'success' : 'error')
+    return
+  }
+
+  if (action === 'export-json') {
+    const task = context.exports?.task
+    if (!task) {
+      setStatusNote('无法生成导出数据。', 'error')
+      return
+    }
+    if (task.resource) {
+      task.resource.status = item.status || task.resource.status
+      task.resource.hasCookieHeader = !!item.hasCookieHeader
+      task.resource.hasAuthorizationHeader = !!item.hasAuthorizationHeader
+      task.resource.cookieState = item.hasCookieHeader ? 'present-redacted' : 'not-observed'
+      task.resource.authorizationState = item.hasAuthorizationHeader ? 'present-redacted' : 'not-observed'
+      task.exportedAt = new Date().toISOString()
+    }
+    const json = JSON.stringify(task, null, 2)
+    const ok = await copyText(json)
+    if (ok) {
+      setStatusNote('任务 JSON 已复制到剪贴板。', 'success')
+      chrome.runtime.sendMessage({
+        type: Shared.MESSAGE_TYPES.SET_MEDIA_STATUS,
+        tabId: currentTabId,
+        key: key,
+        status: 'exported',
+      })
+    } else {
+      setStatusNote('复制失败。', 'error')
+    }
+  }
+}
+
+async function handleDetailAction(key, action) {
+  const item = findMediaByKey(key)
+  if (!item) return
+
+  if (action === 'copy-url') {
+    const ok = await copyText(item.url || '')
+    setStatusNote(ok ? 'URL 已复制。' : '复制失败。', ok ? 'success' : 'error')
+    return
+  }
+
+  if (action === 'copy-referer') {
+    const ok = await copyText(item.referer || '')
+    setStatusNote(ok ? 'Referer 已复制。' : '复制失败。', ok ? 'success' : 'error')
+  }
 }
 
 tabsEl.addEventListener('click', (event) => {
@@ -364,23 +685,44 @@ mediaListEl.addEventListener('click', (event) => {
     return
   }
 
+  const expandButton = event.target.closest('.js-expand')
+  if (expandButton) {
+    const key = expandButton.dataset.key
+    if (expandedKeys.has(key)) {
+      expandedKeys.delete(key)
+    } else {
+      expandedKeys.add(key)
+    }
+    renderActiveList()
+    return
+  }
+
   const streamButton = event.target.closest('.js-stream-action')
   if (streamButton) {
-    handleStreamAction(streamButton.dataset.id, streamButton.dataset.action)
+    handleStreamAction(streamButton.dataset.key, streamButton.dataset.action)
+    return
+  }
+
+  const detailButton = event.target.closest('.js-detail-action')
+  if (detailButton) {
+    handleDetailAction(detailButton.dataset.key, detailButton.dataset.action)
     return
   }
 
   const button = event.target.closest('.btn-dl')
   if (!button) return
-  downloadMedia(button.dataset.id, button)
+  const item = findMediaById(button.dataset.id) || findMediaByKey(button.dataset.key)
+  if (!item) return
+  downloadMedia(item, button)
 })
 
 document.getElementById('btnClear').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: Shared.MESSAGE_TYPES.CLEAR_MEDIA }, () => {
     currentMedia = []
     normalizedMedia = []
-    streamContextById.clear()
-    pendingStreamIds.clear()
+    streamContextByKey.clear()
+    pendingStreamKeys.clear()
+    expandedKeys.clear()
     mediaListEl.innerHTML = ''
     tabsEl.innerHTML = ''
     emptyTip.style.display = 'block'

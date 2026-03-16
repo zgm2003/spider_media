@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box }
-body { width: 440px; min-height: 300px; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #333 }
+body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #333 }
 
 .header { padding: 12px 16px; background: #409eff; color: #fff; display: flex; align-items: center; justify-content: space-between }
 .header h1 { font-size: 15px; font-weight: 600 }
@@ -16,12 +16,14 @@ body { width: 440px; min-height: 300px; font-family: "Segoe UI", "Microsoft YaHe
 .page-url { font-size: 12px; color: #909399 }
 
 .media-list { max-height: 440px; overflow-y: auto }
-.media-item { background: #fff; border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px }
+.media-item { background: #fff; border: 1px solid #ebeef5; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; transition: border-color .16s ease, box-shadow .16s ease }
+.media-item.expanded { border-color: #bfdcff; box-shadow: 0 0 0 1px rgba(64,158,255,.1) }
 .media-item .row { display: flex; align-items: center; justify-content: space-between; gap: 8px }
 .media-item .filename { font-size: 13px; font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .media-item .meta { font-size: 11px; color: #909399; margin-top: 4px }
 .media-item .meta span { margin-right: 10px }
 .thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 4px; border: 1px solid #dcdfe6; cursor: zoom-in; flex-shrink: 0; background: #f5f7fa }
+.row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0 }
 
 .tabs { display: flex; gap: 6px; margin-bottom: 10px; overflow-x: auto; padding-bottom: 2px }
 .tab-btn { border: 1px solid #dcdfe6; background: #fff; color: #606266; border-radius: 14px; font-size: 12px; padding: 3px 10px; cursor: pointer; white-space: nowrap }
@@ -34,6 +36,11 @@ body { width: 440px; min-height: 300px; font-family: "Segoe UI", "Microsoft YaHe
 .tag.image { background: #f0f9eb; color: #67c23a }
 .tag.other { background: #f4f4f5; color: #909399 }
 .tag.stream { background: #fef0f0; color: #f56c6c }
+.tag.status { background: #eef6ff; color: #2d70b3 }
+.tag.status.analyzed { background: #ecf5ff; color: #409eff }
+.tag.status.exported { background: #fdf6ec; color: #d48806 }
+.tag.status.downloaded { background: #f0f9eb; color: #3f8f2e }
+.tag.status.failed { background: #fef0f0; color: #d85a5a }
 
 .btn-sm { padding: 4px 10px; font-size: 11px; background: #f0f2f5; border: 1px solid #dcdfe6; border-radius: 4px; cursor: pointer; color: #606266 }
 .btn-sm:hover { background: #e4e7ed }
@@ -56,13 +63,35 @@ body { width: 440px; min-height: 300px; font-family: "Segoe UI", "Microsoft YaHe
 .status-note[data-tone="success"] { background: #f0f9eb; color: #4e8a2f; border-color: #cde7b9 }
 
 .note { margin-top: 6px; font-size: 11px; color: #e6a23c; line-height: 1.4 }
-.stream-tools { display: flex; gap: 6px; margin-top: 8px }
+.context-note { margin-top: 6px; font-size: 11px; color: #8b6a26; line-height: 1.4 }
+.stream-tools { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap }
 .stream-summary { margin-top: 8px; padding: 8px 10px; background: #f5f7fa; border: 1px solid #ebeef5; border-radius: 6px; font-size: 11px; color: #606266; line-height: 1.5 }
 .stream-title { font-weight: 600; color: #303133; margin-bottom: 2px }
+.details-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid #ebeef5; display: flex; flex-direction: column; gap: 10px }
+.detail-actions { display: flex; gap: 6px; flex-wrap: wrap }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px }
+.detail-field { background: #f7f9fc; border: 1px solid #ebeef5; border-radius: 6px; padding: 8px 9px; min-width: 0 }
+.detail-field.wide { grid-column: 1 / -1 }
+.detail-label { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: #909399; margin-bottom: 4px }
+.detail-value { font-size: 12px; color: #303133; line-height: 1.45; word-break: break-word; white-space: pre-wrap }
+.detail-value.mono { font-family: Consolas, "SFMono-Regular", monospace; font-size: 11px }
+.analysis-panel { display: flex; flex-direction: column; gap: 8px }
+.analysis-card { background: #fff; border: 1px solid #ebeef5; border-radius: 6px; padding: 8px 10px }
+.analysis-title { font-size: 11px; font-weight: 600; color: #303133; margin-bottom: 6px }
+.analysis-item { padding: 6px 0; border-top: 1px dashed #ebeef5 }
+.analysis-item:first-child { border-top: none; padding-top: 0 }
+.analysis-main { font-size: 12px; color: #303133; word-break: break-word }
+.analysis-sub { font-size: 11px; color: #909399; margin-top: 2px; line-height: 1.4; word-break: break-word }
+.analysis-empty { font-size: 11px; color: #909399; line-height: 1.5 }
 
 .preview-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 9999; padding: 20px }
 .preview-mask.show { display: flex }
 .preview-img { max-width: min(90vw, 980px); max-height: 85vh; border-radius: 8px; background: #fff; box-shadow: 0 10px 30px rgba(0,0,0,.35) }
+
+@media (max-width: 520px) {
+  body { width: 100%; min-width: 0 }
+  .detail-grid { grid-template-columns: 1fr }
+}
 </style>
 </head>
 <body>

@@ -9,9 +9,19 @@ const Shared = globalThis.MediaSnifferShared
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
 const STREAM_CACHE_TTL_MS = 5 * 60 * 1000
 const STREAM_CACHE_LIMIT = 120
+const REQUEST_CONTEXT_TTL_MS = 2 * 60 * 1000
+const REQUEST_CONTEXT_LIMIT = 2000
+
+const STATUS_RANK = {
+  failed: -1,
+  discovered: 0,
+  analyzed: 1,
+  exported: 2,
+  downloaded: 3,
+}
 
 const mediaByTab = new Map()
-const refererByRequestId = new Map()
+const requestContextById = new Map()
 const streamContextCache = new Map()
 let captureSettings = { ...Shared.DEFAULT_CAPTURE_SETTINGS }
 
@@ -21,16 +31,17 @@ chrome.storage.local.get(['captureSettings'], (data) => {
 
 function getTabState(tabId) {
   if (!mediaByTab.has(tabId)) {
-    mediaByTab.set(tabId, { recordsByUrl: new Map() })
+    mediaByTab.set(tabId, { recordsByKey: new Map() })
   }
   return mediaByTab.get(tabId)
 }
 
 function listTabMedia(tabId, fallbackReferer) {
-  const records = Array.from(mediaByTab.get(tabId)?.recordsByUrl.values() || [])
+  const records = Array.from(mediaByTab.get(tabId)?.recordsByKey.values() || [])
   return records.map((item) => ({
     ...item,
     referer: item.referer || fallbackReferer || '',
+    refererOrigin: item.refererOrigin || Shared.getOrigin(item.referer || fallbackReferer || '', item.url || ''),
   }))
 }
 
@@ -38,12 +49,76 @@ function categoryScore(category) {
   return category === 'other' ? 0 : 1
 }
 
+function statusRank(status) {
+  return Object.prototype.hasOwnProperty.call(STATUS_RANK, status) ? STATUS_RANK[status] : 0
+}
+
+function selectProgressStatus(currentStatus, nextStatus) {
+  const current = currentStatus || 'discovered'
+  const next = nextStatus || current
+
+  if (next === 'failed') {
+    return current === 'downloaded' ? current : next
+  }
+
+  if (current === 'failed') return next
+  return statusRank(next) >= statusRank(current) ? next : current
+}
+
+function uniqueStringList(values) {
+  return Array.from(new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean)))
+}
+
+function normalizeHeaderMap(raw) {
+  const result = {}
+  const entries = Array.isArray(raw)
+    ? raw.map((item) => [item?.name, item?.value])
+    : Object.entries(raw || {})
+
+  for (const [name, value] of entries) {
+    const key = String(name || '').trim().toLowerCase()
+    if (!key) continue
+    const sensitive = key === 'cookie' || key === 'authorization' || key === 'proxy-authorization'
+    result[key] = sensitive ? '[redacted]' : String(value || '')
+  }
+
+  return result
+}
+
 function decorateMediaRecord(record) {
   const category = Shared.normalizeCategory(record)
+  const requestHeaders = normalizeHeaderMap(record.requestHeaders)
+  const responseHeaders = normalizeHeaderMap(record.responseHeaders)
+  const sourceList = uniqueStringList([...(record.sourceList || []), record.source])
+  const referer = record.referer || ''
+  const key = record.key || Shared.buildMediaKey(record.url, referer, record.frameId)
+
   return {
     ...record,
+    key,
     category,
+    finalUrl: record.finalUrl || record.url || '',
     filename: Shared.sanitizeFilename(record.filename || Shared.extractFilename(record.url)),
+    requestHeaders,
+    responseHeaders,
+    referer,
+    refererOrigin: record.refererOrigin || Shared.getOrigin(referer, record.url || ''),
+    source: record.source || sourceList[0] || 'unknown',
+    sourceList,
+    method: record.method || '',
+    initiator: record.initiator || '',
+    fromCache: !!record.fromCache,
+    status: record.status || 'discovered',
+    hasCookieHeader:
+      typeof record.hasCookieHeader === 'boolean'
+        ? record.hasCookieHeader
+        : Object.prototype.hasOwnProperty.call(requestHeaders, 'cookie'),
+    hasAuthorizationHeader:
+      typeof record.hasAuthorizationHeader === 'boolean'
+        ? record.hasAuthorizationHeader
+        : Object.prototype.hasOwnProperty.call(requestHeaders, 'authorization') ||
+          Object.prototype.hasOwnProperty.call(requestHeaders, 'proxy-authorization'),
+    lastError: record.lastError || '',
     downloadMode: Shared.getDownloadMode({ ...record, category }),
     downloadNotice: Shared.getDownloadNotice({ ...record, category }),
   }
@@ -53,30 +128,74 @@ function mergeMediaRecord(oldItem, newItem) {
   const oldCategory = oldItem.category || 'other'
   const newCategory = newItem.category || 'other'
   const preferNewCategory = categoryScore(newCategory) > categoryScore(oldCategory)
+  const mergedRequestHeaders = { ...(oldItem.requestHeaders || {}), ...(newItem.requestHeaders || {}) }
+  const mergedResponseHeaders = { ...(oldItem.responseHeaders || {}), ...(newItem.responseHeaders || {}) }
 
   return decorateMediaRecord({
     ...oldItem,
     ...newItem,
     id: oldItem.id || newItem.id,
+    key: oldItem.key || newItem.key,
     category: preferNewCategory ? newCategory : oldCategory,
     categoryHint: newItem.categoryHint || oldItem.categoryHint || '',
     contentType: newItem.contentType || oldItem.contentType || '',
     size: newItem.size || oldItem.size || '',
     sizeBytes: newItem.sizeBytes || oldItem.sizeBytes || 0,
     referer: newItem.referer || oldItem.referer || '',
+    refererOrigin: newItem.refererOrigin || oldItem.refererOrigin || '',
+    finalUrl: newItem.finalUrl || oldItem.finalUrl || newItem.url || oldItem.url || '',
     filename: newItem.filename || oldItem.filename || 'media',
     frameId: Number.isInteger(newItem.frameId) ? newItem.frameId : oldItem.frameId,
     platform: newItem.platform || oldItem.platform || 'generic',
     source: newItem.source || oldItem.source || 'unknown',
+    sourceList: uniqueStringList([...(oldItem.sourceList || []), ...(newItem.sourceList || []), oldItem.source, newItem.source]),
+    method: newItem.method || oldItem.method || '',
+    initiator: newItem.initiator || oldItem.initiator || '',
+    fromCache: newItem.fromCache || oldItem.fromCache || false,
+    requestHeaders: mergedRequestHeaders,
+    responseHeaders: mergedResponseHeaders,
+    hasCookieHeader: typeof newItem.hasCookieHeader === 'boolean' ? newItem.hasCookieHeader : !!oldItem.hasCookieHeader,
+    hasAuthorizationHeader: typeof newItem.hasAuthorizationHeader === 'boolean' ? newItem.hasAuthorizationHeader : !!oldItem.hasAuthorizationHeader,
+    status: selectProgressStatus(oldItem.status, newItem.status),
+    lastError: newItem.lastError || oldItem.lastError || '',
     time: newItem.time || oldItem.time || Date.now(),
   })
 }
 
 function trimTabState(state) {
-  while (state.recordsByUrl.size > Shared.MAX_MEDIA_PER_TAB) {
-    const firstKey = state.recordsByUrl.keys().next().value
-    state.recordsByUrl.delete(firstKey)
+  while (state.recordsByKey.size > Shared.MAX_MEDIA_PER_TAB) {
+    const firstKey = state.recordsByKey.keys().next().value
+    state.recordsByKey.delete(firstKey)
   }
+}
+
+function cleanupRequestContexts() {
+  const now = Date.now()
+  for (const [requestId, entry] of requestContextById.entries()) {
+    if (!entry || now - entry.createdAt > REQUEST_CONTEXT_TTL_MS) {
+      requestContextById.delete(requestId)
+    }
+  }
+
+  while (requestContextById.size > REQUEST_CONTEXT_LIMIT) {
+    const firstKey = requestContextById.keys().next().value
+    requestContextById.delete(firstKey)
+  }
+}
+
+function storeRequestContext(requestId, context) {
+  cleanupRequestContexts()
+  requestContextById.set(requestId, {
+    ...context,
+    createdAt: Date.now(),
+  })
+  cleanupRequestContexts()
+}
+
+function takeRequestContext(requestId) {
+  const entry = requestContextById.get(requestId) || null
+  requestContextById.delete(requestId)
+  return entry
 }
 
 function ignoreLastError() {
@@ -84,7 +203,7 @@ function ignoreLastError() {
 }
 
 function updateBadge(tabId) {
-  const count = mediaByTab.get(tabId)?.recordsByUrl.size || 0
+  const count = mediaByTab.get(tabId)?.recordsByKey.size || 0
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : '', tabId })
   chrome.action.setBadgeBackgroundColor({ color: '#409eff', tabId })
 }
@@ -97,7 +216,7 @@ function notifyMediaUpdated(tabId) {
     {
       type: Shared.MESSAGE_TYPES.MEDIA_UPDATED,
       tabId,
-      count: mediaByTab.get(tabId)?.recordsByUrl.size || 0,
+      count: mediaByTab.get(tabId)?.recordsByKey.size || 0,
     },
     ignoreLastError
   )
@@ -106,7 +225,7 @@ function notifyMediaUpdated(tabId) {
     {
       type: Shared.MESSAGE_TYPES.MEDIA_UPDATED,
       tabId,
-      count: mediaByTab.get(tabId)?.recordsByUrl.size || 0,
+      count: mediaByTab.get(tabId)?.recordsByKey.size || 0,
     },
     ignoreLastError
   )
@@ -114,24 +233,42 @@ function notifyMediaUpdated(tabId) {
 
 function upsertMediaRecord(tabId, nextItem) {
   const state = getTabState(tabId)
-  const existing = state.recordsByUrl.get(nextItem.url)
+  const key = nextItem.key || Shared.buildMediaKey(nextItem.url, nextItem.referer || '', nextItem.frameId)
+  const existing = state.recordsByKey.get(key)
   const normalized = decorateMediaRecord({
     ...nextItem,
+    key,
     id: existing?.id || nextItem.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   })
 
   if (!Shared.isCategoryEnabled(captureSettings, normalized.category)) return
 
-  state.recordsByUrl.set(nextItem.url, existing ? mergeMediaRecord(existing, normalized) : normalized)
+  state.recordsByKey.set(key, existing ? mergeMediaRecord(existing, normalized) : normalized)
   trimTabState(state)
+  notifyMediaUpdated(tabId)
+}
+
+function patchMediaRecord(tabId, recordKey, patch) {
+  const state = mediaByTab.get(tabId)
+  if (!state || !recordKey || !state.recordsByKey.has(recordKey)) return
+
+  const existing = state.recordsByKey.get(recordKey)
+  const merged = mergeMediaRecord(existing, {
+    ...existing,
+    ...patch,
+    id: existing.id,
+    key: existing.key,
+    status: selectProgressStatus(existing.status, patch.status || existing.status),
+  })
+  state.recordsByKey.set(recordKey, merged)
   notifyMediaUpdated(tabId)
 }
 
 function filterByCaptureSettings() {
   for (const [tabId, state] of mediaByTab.entries()) {
-    for (const [url, item] of state.recordsByUrl.entries()) {
+    for (const [key, item] of state.recordsByKey.entries()) {
       if (!Shared.isCategoryEnabled(captureSettings, item.category || 'other')) {
-        state.recordsByUrl.delete(url)
+        state.recordsByKey.delete(key)
       }
     }
     notifyMediaUpdated(tabId)
@@ -140,7 +277,7 @@ function filterByCaptureSettings() {
 
 function clearTabMedia(tabId) {
   if (!mediaByTab.has(tabId)) return
-  mediaByTab.get(tabId).recordsByUrl.clear()
+  mediaByTab.get(tabId).recordsByKey.clear()
   notifyMediaUpdated(tabId)
 }
 
@@ -284,24 +421,42 @@ function parseHlsManifest(text, manifestUrl) {
   let variantCount = 0
   let segmentCount = 0
   let encrypted = false
+  let encryptionMethod = ''
   let targetDuration = 0
   let playlistType = ''
   let hasEndList = false
   let firstVariantUrl = ''
   let firstSegmentUrl = ''
-  let waitingVariantUrl = false
+  let totalDurationSeconds = 0
+  let waitingVariantAttrs = null
 
+  const variants = []
+  const mediaTracks = []
   const resolutions = []
   const bandwidths = []
 
   for (const line of lines) {
+    if (line.startsWith('#EXT-X-MEDIA')) {
+      const attrs = parseAttributeList(line)
+      mediaTracks.push({
+        type: String(attrs.type || '').toLowerCase(),
+        groupId: attrs['group-id'] || '',
+        name: attrs.name || '',
+        language: attrs.language || '',
+        default: attrs.default || '',
+        autoselect: attrs.autoselect || '',
+        uri: attrs.uri ? Shared.toAbsoluteUrl(attrs.uri, manifestUrl) : '',
+        instreamId: attrs['instream-id'] || '',
+      })
+      continue
+    }
+
     if (line.startsWith('#EXT-X-STREAM-INF')) {
       variantCount += 1
-      waitingVariantUrl = true
-      const attrs = parseAttributeList(line)
-      if (attrs.resolution) resolutions.push(attrs.resolution)
-      if (attrs.bandwidth) {
-        const numericBandwidth = parseInt(attrs.bandwidth, 10)
+      waitingVariantAttrs = parseAttributeList(line)
+      if (waitingVariantAttrs.resolution) resolutions.push(waitingVariantAttrs.resolution)
+      if (waitingVariantAttrs.bandwidth) {
+        const numericBandwidth = parseInt(waitingVariantAttrs.bandwidth, 10)
         if (Number.isFinite(numericBandwidth)) bandwidths.push(numericBandwidth)
       }
       continue
@@ -310,11 +465,32 @@ function parseHlsManifest(text, manifestUrl) {
     if (line.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
       variantCount += 1
       const attrs = parseAttributeList(line)
-      if (attrs.uri && !firstVariantUrl) firstVariantUrl = Shared.toAbsoluteUrl(attrs.uri, manifestUrl)
+      const absoluteUrl = attrs.uri ? Shared.toAbsoluteUrl(attrs.uri, manifestUrl) : ''
+      variants.push({
+        type: 'iframe',
+        url: absoluteUrl,
+        resolution: attrs.resolution || '',
+        bandwidth: parseInt(attrs.bandwidth || '0', 10) || 0,
+        codecs: attrs.codecs || '',
+        audioGroup: attrs.audio || '',
+        subtitlesGroup: attrs.subtitles || '',
+      })
+      if (absoluteUrl && !firstVariantUrl) firstVariantUrl = absoluteUrl
       continue
     }
 
-    if (line.startsWith('#EXT-X-KEY')) encrypted = true
+    if (line.startsWith('#EXTINF:')) {
+      totalDurationSeconds += parseFloat(line.split(':')[1]?.split(',')[0] || '0') || 0
+    }
+
+    if (line.startsWith('#EXT-X-KEY')) {
+      const attrs = parseAttributeList(line)
+      const method = String(attrs.method || '').toUpperCase()
+      if (method && method !== 'NONE') {
+        encrypted = true
+        if (!encryptionMethod) encryptionMethod = method
+      }
+    }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) targetDuration = parseInt(line.split(':')[1] || '0', 10) || 0
     if (line.startsWith('#EXT-X-PLAYLIST-TYPE:')) playlistType = (line.split(':')[1] || '').trim()
     if (line.startsWith('#EXT-X-ENDLIST')) hasEndList = true
@@ -322,9 +498,19 @@ function parseHlsManifest(text, manifestUrl) {
     if (line.startsWith('#')) continue
 
     const absoluteUrl = Shared.toAbsoluteUrl(line, manifestUrl)
-    if (waitingVariantUrl) {
+    if (waitingVariantAttrs) {
       if (!firstVariantUrl) firstVariantUrl = absoluteUrl
-      waitingVariantUrl = false
+      variants.push({
+        type: 'variant',
+        url: absoluteUrl,
+        resolution: waitingVariantAttrs.resolution || '',
+        bandwidth: parseInt(waitingVariantAttrs.bandwidth || '0', 10) || 0,
+        codecs: waitingVariantAttrs.codecs || '',
+        audioGroup: waitingVariantAttrs.audio || '',
+        subtitlesGroup: waitingVariantAttrs.subtitles || '',
+        frameRate: waitingVariantAttrs['frame-rate'] || '',
+      })
+      waitingVariantAttrs = null
       continue
     }
 
@@ -334,6 +520,7 @@ function parseHlsManifest(text, manifestUrl) {
 
   const manifestType = variantCount > 0 ? 'master' : 'media'
   const isLive = manifestType === 'media' ? !hasEndList && String(playlistType).toUpperCase() !== 'VOD' : false
+  const durationLabel = totalDurationSeconds ? formatSeconds(totalDurationSeconds) : ''
   const bandwidthSummary = bandwidths.length
     ? `${Math.round(Math.min(...bandwidths) / 1000)}-${Math.round(Math.max(...bandwidths) / 1000)} kbps`
     : ''
@@ -342,6 +529,8 @@ function parseHlsManifest(text, manifestUrl) {
   if (targetDuration) details.push(`目标分片时长 ${targetDuration}s`)
   if (resolutions.length) details.push(`分辨率 ${resolutions.slice(0, 3).join(', ')}`)
   if (bandwidthSummary) details.push(`码率 ${bandwidthSummary}`)
+  if (durationLabel) details.push(`总时长约 ${durationLabel}`)
+  if (encryptionMethod) details.push(`加密方式 ${encryptionMethod}`)
   if (firstVariantUrl) details.push(`示例变体 ${firstVariantUrl}`)
   if (firstSegmentUrl) details.push(`首个分片 ${firstSegmentUrl}`)
 
@@ -354,6 +543,13 @@ function parseHlsManifest(text, manifestUrl) {
     isLive,
     playlistType: playlistType || (isLive ? 'LIVE' : 'VOD'),
     targetDuration,
+    totalDurationSeconds: Math.round(totalDurationSeconds),
+    durationLabel,
+    encryptionMethod,
+    variants,
+    mediaTracks,
+    firstVariantUrl,
+    firstSegmentUrl,
     details,
     summary: [
       manifestType === 'master' ? 'HLS 主索引' : 'HLS 媒体列表',
@@ -366,33 +562,79 @@ function parseHlsManifest(text, manifestUrl) {
   }
 }
 
-function getXmlAttribute(tagText, attrName) {
-  const re = new RegExp(`${attrName}="([^"]+)"`, 'i')
-  const match = String(tagText || '').match(re)
-  return match?.[1] || ''
+function parseXmlAttributes(fragment) {
+  const attrs = {}
+  const re = /([A-Za-z_:][\w:.-]*)="([^"]*)"/g
+  let match = re.exec(String(fragment || ''))
+  while (match) {
+    attrs[String(match[1] || '').toLowerCase()] = match[2] || ''
+    match = re.exec(String(fragment || ''))
+  }
+  return attrs
 }
 
 function parseDashManifest(text, manifestUrl) {
   const source = String(text || '').replace(/^\uFEFF/, '')
-  const mpdTag = source.match(/<MPD\b[^>]*>/i)?.[0] || ''
-  if (!mpdTag) throw new Error('无效的 DASH 索引文件')
+  const mpdMatch = source.match(/<MPD\b([^>]*)>/i)
+  if (!mpdMatch) throw new Error('无效的 DASH 索引文件')
 
-  const type = getXmlAttribute(mpdTag, 'type') || 'static'
-  const durationRaw = getXmlAttribute(mpdTag, 'mediaPresentationDuration')
-  const adaptationSetCount = (source.match(/<AdaptationSet\b/gi) || []).length
-  const representationCount = (source.match(/<Representation\b/gi) || []).length
+  const mpdAttrs = parseXmlAttributes(mpdMatch[1] || '')
+  const type = mpdAttrs.type || 'static'
+  const durationRaw = mpdAttrs.mediapresentationduration || ''
   const segmentTemplateCount = (source.match(/<SegmentTemplate\b/gi) || []).length
   const segmentTimelineEntryCount = (source.match(/<S\b/gi) || []).length
   const encrypted = /<ContentProtection\b/i.test(source)
-  const firstBaseUrl = source.match(/<BaseURL>([^<]+)<\/BaseURL>/i)?.[1]?.trim() || ''
+  const baseUrls = Array.from(source.matchAll(/<BaseURL>([^<]+)<\/BaseURL>/gi)).map((match) => {
+    return Shared.toAbsoluteUrl(match[1]?.trim() || '', manifestUrl)
+  })
+  const firstBaseUrl = baseUrls[0] || ''
   const durationSeconds = parseIsoDurationToSeconds(durationRaw)
   const isLive = type.toLowerCase() === 'dynamic'
+  const durationLabel = durationSeconds ? formatSeconds(durationSeconds) : ''
+
+  const adaptationSets = Array.from(source.matchAll(/<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi)).map(
+    (match, index) => {
+      const attrs = parseXmlAttributes(match[1] || '')
+      const body = match[2] || ''
+      const mimeType = attrs.mimetype || ''
+      const rawType = String(attrs.contenttype || '').toLowerCase()
+      const inferredType = rawType || (
+        /^video\//i.test(mimeType) ? 'video' :
+        /^audio\//i.test(mimeType) ? 'audio' :
+        /(text|subtitle|ttml|vtt)/i.test(mimeType) ? 'subtitle' :
+        'unknown'
+      )
+      const representations = Array.from(body.matchAll(/<Representation\b([^>]*)/gi)).map((repMatch, repIndex) => {
+        const repAttrs = parseXmlAttributes(repMatch[1] || '')
+        return {
+          id: repAttrs.id || `rep-${index + 1}-${repIndex + 1}`,
+          bandwidth: parseInt(repAttrs.bandwidth || '0', 10) || 0,
+          codecs: repAttrs.codecs || '',
+          width: parseInt(repAttrs.width || '0', 10) || 0,
+          height: parseInt(repAttrs.height || '0', 10) || 0,
+          mimeType: repAttrs.mimetype || mimeType,
+        }
+      })
+
+      return {
+        id: attrs.id || `as-${index + 1}`,
+        type: inferredType,
+        mimeType,
+        language: attrs.lang || attrs.language || '',
+        segmentAlignment: attrs.segmentalignment || '',
+        representations,
+      }
+    }
+  )
+
+  const adaptationSetCount = adaptationSets.length
+  const representationCount = adaptationSets.reduce((sum, item) => sum + item.representations.length, 0)
 
   const details = []
   if (adaptationSetCount) details.push(`${adaptationSetCount} 个 AdaptationSet`)
   if (segmentTemplateCount) details.push(`${segmentTemplateCount} 个 SegmentTemplate 节点`)
   if (segmentTimelineEntryCount) details.push(`${segmentTimelineEntryCount} 条时间线条目`)
-  if (durationSeconds) details.push(`时长 ${formatSeconds(durationSeconds)}`)
+  if (durationLabel) details.push(`时长 ${durationLabel}`)
   if (firstBaseUrl) details.push(`基础地址 ${Shared.toAbsoluteUrl(firstBaseUrl, manifestUrl)}`)
 
   return {
@@ -405,6 +647,9 @@ function parseDashManifest(text, manifestUrl) {
     encrypted,
     isLive,
     durationSeconds,
+    durationLabel,
+    baseUrls,
+    adaptationSets,
     details,
     summary: [
       'DASH 索引',
@@ -414,14 +659,6 @@ function parseDashManifest(text, manifestUrl) {
     ]
       .filter(Boolean)
       .join(' | '),
-  }
-}
-
-function getOrigin(url) {
-  try {
-    return new URL(url).origin
-  } catch (_) {
-    return ''
   }
 }
 
@@ -435,6 +672,16 @@ function buildStreamOutputFilename(record) {
   return Shared.replaceFileExtension(record.filename || Shared.extractFilename(record.url), 'mp4')
 }
 
+function buildReplayHeaders(record) {
+  const headers = []
+  if (record.referer) headers.push({ name: 'Referer', value: record.referer })
+
+  const origin = Shared.getOrigin(record.referer || record.url, record.url)
+  if (origin) headers.push({ name: 'Origin', value: origin })
+
+  return headers
+}
+
 function buildFfmpegCommand(record) {
   const parts = ['ffmpeg']
   parts.push(`-user_agent "${escapePowerShellArgument(DEFAULT_USER_AGENT)}"`)
@@ -443,9 +690,12 @@ function buildFfmpegCommand(record) {
     parts.push(`-referer "${escapePowerShellArgument(record.referer)}"`)
   }
 
-  const origin = getOrigin(record.referer || record.url)
-  if (origin) {
-    parts.push(`-headers "Origin: ${escapePowerShellArgument(origin)}"`)
+  const headerLines = buildReplayHeaders(record)
+    .filter((header) => header.name !== 'Referer')
+    .map((header) => `${header.name}: ${header.value}`)
+
+  if (headerLines.length) {
+    parts.push(`-headers "${escapePowerShellArgument(headerLines.join('`r`n'))}"`)
   }
 
   parts.push(`-i "${escapePowerShellArgument(record.url)}"`)
@@ -454,8 +704,105 @@ function buildFfmpegCommand(record) {
   return parts.join(' ')
 }
 
+function buildYtDlpCommand(record) {
+  const parts = ['yt-dlp']
+  parts.push(`--user-agent "${escapePowerShellArgument(DEFAULT_USER_AGENT)}"`)
+
+  if (record.referer) {
+    parts.push(`--referer "${escapePowerShellArgument(record.referer)}"`)
+  }
+
+  for (const header of buildReplayHeaders(record)) {
+    if (header.name === 'Referer') continue
+    parts.push(`--add-header "${escapePowerShellArgument(`${header.name}: ${header.value}`)}"`)
+  }
+
+  parts.push(`-o "${escapePowerShellArgument(buildStreamOutputFilename(record))}"`)
+  parts.push(`"${escapePowerShellArgument(record.url)}"`)
+  return parts.join(' ')
+}
+
+function buildCurlCommand(record) {
+  const parts = ['curl.exe', '-L']
+  parts.push(`-A "${escapePowerShellArgument(DEFAULT_USER_AGENT)}"`)
+
+  if (record.referer) {
+    parts.push(`-e "${escapePowerShellArgument(record.referer)}"`)
+  }
+
+  for (const header of buildReplayHeaders(record)) {
+    if (header.name === 'Referer') continue
+    parts.push(`-H "${escapePowerShellArgument(`${header.name}: ${header.value}`)}"`)
+  }
+
+  parts.push(`-o "${escapePowerShellArgument(record.filename || Shared.extractFilename(record.url))}"`)
+  parts.push(`"${escapePowerShellArgument(record.url)}"`)
+  return parts.join(' ')
+}
+
+function buildExportTaskPayload(record, context) {
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    resource: {
+      id: record.id || '',
+      key: record.key || Shared.buildMediaKey(record.url, record.referer || '', record.frameId),
+      status: record.status || 'discovered',
+      category: record.category || Shared.normalizeCategory(record),
+      filename: record.filename || Shared.extractFilename(record.url),
+      url: record.url,
+      finalUrl: context?.resolvedUrl || record.finalUrl || record.url,
+      contentType: record.contentType || '',
+      sizeBytes: Shared.parseContentLength(record.sizeBytes),
+      size: record.size || '',
+      referer: record.referer || '',
+      refererOrigin: record.refererOrigin || Shared.getOrigin(record.referer || '', record.url || ''),
+      frameId: Number.isInteger(record.frameId) ? record.frameId : null,
+      method: record.method || '',
+      initiator: record.initiator || '',
+      fromCache: !!record.fromCache,
+      sourceList: record.sourceList || [],
+      requestHeaders: record.requestHeaders || {},
+      responseHeaders: record.responseHeaders || {},
+      cookieState: record.hasCookieHeader ? 'present-redacted' : 'not-observed',
+      authorizationState: record.hasAuthorizationHeader ? 'present-redacted' : 'not-observed',
+    },
+    stream: context
+      ? {
+          kind: context.kind,
+          summary: context.summary,
+          resolvedUrl: context.resolvedUrl || record.url,
+          analyzedAt: context.analyzedAt || null,
+          analysis: context.analysis || null,
+          commands: {
+            ffmpeg: buildFfmpegCommand(record),
+            ytDlp: buildYtDlpCommand(record),
+            curl: buildCurlCommand(record),
+          },
+        }
+      : null,
+  }
+}
+
+function attachStreamExports(baseContext, record) {
+  const exports = {
+    commands: {
+      ffmpeg: buildFfmpegCommand(record),
+      ytDlp: buildYtDlpCommand(record),
+      curl: buildCurlCommand(record),
+    },
+    task: buildExportTaskPayload(record, baseContext),
+  }
+
+  return {
+    ...baseContext,
+    exports,
+    command: exports.commands.ffmpeg,
+  }
+}
+
 function getStreamCacheKey(record) {
-  return `${record.url}|${record.referer || ''}|${record.frameId || ''}`
+  return record.key || Shared.buildMediaKey(record.url, record.referer || '', record.frameId)
 }
 
 function cleanupStreamContextCache() {
@@ -511,10 +858,10 @@ async function getStreamContext(record, tabId, forceRefresh) {
   if (!forceRefresh) {
     const cached = streamContextCache.get(cacheKey)
     if (cached && Date.now() - cached.updatedAt <= STREAM_CACHE_TTL_MS) {
-      return {
-        ...cached.context,
-        command: buildFfmpegCommand(record),
-      }
+      return attachStreamExports(cached.context, {
+        ...record,
+        finalUrl: cached.context.resolvedUrl || record.finalUrl || record.url,
+      })
     }
   }
 
@@ -529,6 +876,7 @@ async function getStreamContext(record, tabId, forceRefresh) {
     summary: analysis.summary,
     details: analysis.details || [],
     analysis,
+    resolvedUrl: manifestUrl,
     analyzedAt: Date.now(),
   }
 
@@ -538,10 +886,10 @@ async function getStreamContext(record, tabId, forceRefresh) {
   })
 
   cleanupStreamContextCache()
-  return {
-    ...context,
-    command: buildFfmpegCommand(record),
-  }
+  return attachStreamExports(context, {
+    ...record,
+    finalUrl: manifestUrl,
+  })
 }
 
 async function handleDownloadRequest(msg, sender, sendResponse) {
@@ -552,6 +900,7 @@ async function handleDownloadRequest(msg, sender, sendResponse) {
   }
 
   const record = decorateMediaRecord({
+    key: msg.key,
     url: msg.url,
     filename: msg.filename || Shared.extractFilename(msg.url),
     category: msg.category,
@@ -560,6 +909,8 @@ async function handleDownloadRequest(msg, sender, sendResponse) {
     sizeBytes: Shared.parseContentLength(msg.sizeBytes),
     frameId: Number.isInteger(msg.frameId) ? msg.frameId : sender.frameId,
     referer: msg.referer || '',
+    requestHeaders: msg.requestHeaders || {},
+    responseHeaders: msg.responseHeaders || {},
     time: Date.now(),
   })
 
@@ -569,6 +920,10 @@ async function handleDownloadRequest(msg, sender, sendResponse) {
 
   if (mode === 'manifest' || mode === 'segment' || mode === 'direct') {
     const directResp = await downloadFile({ url: record.url, filename })
+    patchMediaRecord(tabId, record.key, {
+      status: directResp.ok ? 'downloaded' : 'failed',
+      lastError: directResp.ok ? '' : directResp.error || '',
+    })
     sendResponse({ ...directResp, warning })
     return
   }
@@ -576,13 +931,25 @@ async function handleDownloadRequest(msg, sender, sendResponse) {
   try {
     const dataUrl = await resolveMediaDataUrl(record, tabId)
     const result = await downloadFile({ url: dataUrl, filename })
+    patchMediaRecord(tabId, record.key, {
+      status: result.ok ? 'downloaded' : 'failed',
+      lastError: result.ok ? '' : result.error || '',
+    })
     sendResponse({ ...result, warning })
   } catch (err) {
     const fallbackResp = await downloadFile({ url: record.url, filename })
     if (fallbackResp.ok) {
+      patchMediaRecord(tabId, record.key, {
+        status: 'downloaded',
+        lastError: '',
+      })
       sendResponse({ ...fallbackResp, warning })
       return
     }
+    patchMediaRecord(tabId, record.key, {
+      status: 'failed',
+      lastError: `${err.message}; ${fallbackResp.error || ''}`.trim(),
+    })
     sendResponse({
       ok: false,
       error: `所有下载方式都失败了：${err.message}; ${fallbackResp.error || ''}`,
@@ -594,8 +961,15 @@ async function handleDownloadRequest(msg, sender, sendResponse) {
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return
-    const referer = details.requestHeaders?.find((header) => header.name.toLowerCase() === 'referer')?.value || ''
-    if (referer) refererByRequestId.set(details.requestId, referer)
+    const requestHeaders = normalizeHeaderMap(details.requestHeaders || [])
+    storeRequestContext(details.requestId, {
+      referer: requestHeaders.referer || '',
+      requestHeaders,
+      hasCookieHeader: Object.prototype.hasOwnProperty.call(requestHeaders, 'cookie'),
+      hasAuthorizationHeader:
+        Object.prototype.hasOwnProperty.call(requestHeaders, 'authorization') ||
+        Object.prototype.hasOwnProperty.call(requestHeaders, 'proxy-authorization'),
+    })
   },
   { urls: ['<all_urls>'] },
   ['requestHeaders']
@@ -604,16 +978,16 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 chrome.webRequest.onCompleted.addListener(
   (details) => {
     if (details.tabId < 0) return
+    cleanupRequestContexts()
 
     const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value || ''
+    const requestContext = takeRequestContext(details.requestId)
     if (!Shared.shouldCaptureResource(details.url, contentType)) {
-      refererByRequestId.delete(details.requestId)
       return
     }
 
     const category = Shared.inferCategory(details.url, contentType)
     if (!Shared.isCategoryEnabled(captureSettings, category)) {
-      refererByRequestId.delete(details.requestId)
       return
     }
 
@@ -621,25 +995,33 @@ chrome.webRequest.onCompleted.addListener(
     const sizeBytes = Shared.parseContentLength(contentLength)
     upsertMediaRecord(details.tabId, {
       url: details.url,
+      finalUrl: details.url,
       filename: Shared.extractFilename(details.url),
       category,
       platform: Shared.getPlatformStrategy(details.url).name,
       contentType,
       size: Shared.formatSize(contentLength),
       sizeBytes,
-      referer: refererByRequestId.get(details.requestId) || '',
+      referer: requestContext?.referer || '',
+      requestHeaders: requestContext?.requestHeaders || {},
+      responseHeaders: normalizeHeaderMap(details.responseHeaders || []),
+      hasCookieHeader: requestContext?.hasCookieHeader || false,
+      hasAuthorizationHeader: requestContext?.hasAuthorizationHeader || false,
       frameId: details.frameId,
+      method: details.method || '',
+      initiator: details.initiator || '',
+      fromCache: !!details.fromCache,
+      status: 'discovered',
       time: Date.now(),
       source: 'webRequest',
     })
-    refererByRequestId.delete(details.requestId)
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders']
 )
 
 chrome.webRequest.onErrorOccurred.addListener((details) => {
-  refererByRequestId.delete(details.requestId)
+  requestContextById.delete(details.requestId)
 }, { urls: ['<all_urls>'] })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -654,6 +1036,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     upsertMediaRecord(tabId, {
       url: msg.url,
+      key: msg.key,
+      finalUrl: msg.finalUrl || msg.url,
       filename: Shared.sanitizeFilename(msg.filename || Shared.extractFilename(msg.url)),
       category: msg.category || '',
       categoryHint: msg.categoryHint || '',
@@ -663,6 +1047,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sizeBytes: Shared.parseContentLength(msg.sizeBytes),
       referer: msg.referer || sender.tab?.url || '',
       frameId: sender.frameId,
+      method: msg.method || '',
+      initiator: msg.initiator || '',
+      requestHeaders: msg.requestHeaders || {},
+      responseHeaders: msg.responseHeaders || {},
+      status: msg.status || 'discovered',
       time: Date.now(),
       source: msg.source || 'content',
     })
@@ -726,6 +1115,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true
   }
 
+  if (msg.type === Shared.MESSAGE_TYPES.SET_MEDIA_STATUS) {
+    const tabId = msg.tabId || sender.tab?.id
+    if (!tabId || !msg.key) {
+      sendResponse({ ok: false, error: '更新资源状态时缺少 tabId 或 key' })
+      return false
+    }
+
+    patchMediaRecord(tabId, msg.key, {
+      status: msg.status || 'discovered',
+      lastError: msg.lastError || '',
+    })
+    sendResponse({ ok: true })
+    return false
+  }
+
   if (msg.type === Shared.MESSAGE_TYPES.GET_STREAM_CONTEXT) {
     const tabId = msg.tabId || sender.tab?.id
     if (!tabId) {
@@ -734,6 +1138,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     const record = decorateMediaRecord({
+      key: msg.key,
       url: msg.url,
       filename: msg.filename || Shared.extractFilename(msg.url),
       category: msg.category,
@@ -741,14 +1146,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       contentType: msg.contentType || '',
       frameId: Number.isInteger(msg.frameId) ? msg.frameId : sender.frameId,
       referer: msg.referer || '',
+      requestHeaders: msg.requestHeaders || {},
+      responseHeaders: msg.responseHeaders || {},
+      status: msg.status || 'discovered',
       time: Date.now(),
     })
 
     getStreamContext(record, tabId, !!msg.force)
       .then((context) => {
+        patchMediaRecord(tabId, record.key, {
+          status: 'analyzed',
+          finalUrl: context.resolvedUrl || record.url,
+          lastError: '',
+        })
         sendResponse({ ok: true, context })
       })
       .catch((err) => {
+        patchMediaRecord(tabId, record.key, {
+          status: 'failed',
+          lastError: err.message,
+        })
         sendResponse({ ok: false, error: err.message })
       })
     return true

@@ -59,6 +59,7 @@
     FETCH_BLOB: 'fetchBlob',
     FETCH_TEXT: 'fetchText',
     GET_STREAM_CONTEXT: 'getStreamContext',
+    SET_MEDIA_STATUS: 'setMediaStatus',
     TOGGLE_DOCK_PANEL: 'toggleDockPanel',
     GET_CAPTURE_SETTINGS: 'getCaptureSettings',
     SET_CAPTURE_SETTINGS: 'setCaptureSettings',
@@ -86,6 +87,14 @@
   function getPlatformStrategy(url, base) {
     const host = getHostFromUrl(url, base)
     return PLATFORM_STRATEGIES.find((item) => item.host.test(host)) || PLATFORM_STRATEGIES[PLATFORM_STRATEGIES.length - 1]
+  }
+
+  function getOrigin(url, base) {
+    try {
+      return new URL(url, base).origin
+    } catch (_) {
+      return ''
+    }
   }
 
   function isBlobUrl(url, base) {
@@ -165,6 +174,12 @@
     return Number.isFinite(bytes) && bytes >= 0 ? bytes : 0
   }
 
+  function buildMediaKey(url, _referer, frameId, base) {
+    const absUrl = toAbsoluteUrl(url, base)
+    const framePart = Number.isInteger(frameId) ? String(frameId) : 'top'
+    return `${absUrl}|${framePart}`
+  }
+
   function formatSize(value) {
     const bytes = parseContentLength(value)
     if (!bytes) return ''
@@ -241,12 +256,14 @@
     STREAM_SEGMENT_EXTS,
     VIDEO_EXTS,
     buildDownloadPath,
+    buildMediaKey,
     escapeHtml,
     extractFilename,
     formatSize,
     getDownloadMode,
     getDownloadNotice,
     getHostFromUrl,
+    getOrigin,
     getPlatformStrategy,
     inferCategory,
     isBlobUrl,

@@ -11,6 +11,7 @@
 
   const EVENT_NAME = 'media-sniffer:bridge-found'
   const seen = new Set()
+  const MAX_SEEN = 2000
 
   function toAbsoluteUrl(url) {
     try {
@@ -25,6 +26,14 @@
     if (!absUrl || (!/^https?:/i.test(absUrl) && !/^blob:/i.test(absUrl))) return
 
     const key = `${source}:${absUrl}:${extra?.categoryHint || ''}:${extra?.contentType || ''}`
+    if (seen.size >= MAX_SEEN) {
+      let trimCount = Math.floor(MAX_SEEN / 2)
+      for (const seenKey of seen) {
+        seen.delete(seenKey)
+        trimCount -= 1
+        if (trimCount <= 0) break
+      }
+    }
     if (seen.has(key)) return
     seen.add(key)
 

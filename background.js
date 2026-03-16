@@ -24,10 +24,40 @@ const mediaByTab = new Map()
 const requestContextById = new Map()
 const streamContextCache = new Map()
 let captureSettings = { ...Shared.DEFAULT_CAPTURE_SETTINGS }
+let sessionSaveTimer = null
 
 chrome.storage.local.get(['captureSettings'], (data) => {
   captureSettings = Shared.normalizeSettings(data.captureSettings)
 })
+
+function scheduleSessionSave() {
+  if (sessionSaveTimer) clearTimeout(sessionSaveTimer)
+  sessionSaveTimer = setTimeout(() => {
+    const data = {}
+    for (const [tabId, state] of mediaByTab.entries()) {
+      const records = Array.from(state.recordsByKey.values())
+      if (records.length) data[tabId] = records
+    }
+    chrome.storage.session?.set({ mediaByTab: data }).catch(() => {})
+  }, 2000)
+}
+
+function restoreSession() {
+  if (!chrome.storage.session) return
+  chrome.storage.session.get(['mediaByTab'], (result) => {
+    if (chrome.runtime.lastError || !result?.mediaByTab) return
+    for (const [tabIdStr, records] of Object.entries(result.mediaByTab)) {
+      const tabId = Number(tabIdStr)
+      if (!Number.isFinite(tabId) || tabId < 0) continue
+      const state = getTabState(tabId)
+      for (const record of records) {
+        const key = record.key || Shared.buildMediaKey(record.url, record.referer || '', record.frameId)
+        state.recordsByKey.set(key, record)
+      }
+      updateBadge(tabId)
+    }
+  })
+}
 
 function getTabState(tabId) {
   if (!mediaByTab.has(tabId)) {
@@ -119,6 +149,7 @@ function decorateMediaRecord(record) {
         : Object.prototype.hasOwnProperty.call(requestHeaders, 'authorization') ||
           Object.prototype.hasOwnProperty.call(requestHeaders, 'proxy-authorization'),
     lastError: record.lastError || '',
+    biliMeta: record.biliMeta || '',
     downloadMode: Shared.getDownloadMode({ ...record, category }),
     downloadNotice: Shared.getDownloadNotice({ ...record, category }),
   }
@@ -246,6 +277,7 @@ function upsertMediaRecord(tabId, nextItem) {
   state.recordsByKey.set(key, existing ? mergeMediaRecord(existing, normalized) : normalized)
   trimTabState(state)
   notifyMediaUpdated(tabId)
+  scheduleSessionSave()
 }
 
 function patchMediaRecord(tabId, recordKey, patch) {
@@ -262,6 +294,7 @@ function patchMediaRecord(tabId, recordKey, patch) {
   })
   state.recordsByKey.set(recordKey, merged)
   notifyMediaUpdated(tabId)
+  scheduleSessionSave()
 }
 
 function filterByCaptureSettings() {
@@ -279,6 +312,7 @@ function clearTabMedia(tabId) {
   if (!mediaByTab.has(tabId)) return
   mediaByTab.get(tabId).recordsByKey.clear()
   notifyMediaUpdated(tabId)
+  scheduleSessionSave()
 }
 
 function blobToDataUrl(blob) {
@@ -1052,6 +1086,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       requestHeaders: msg.requestHeaders || {},
       responseHeaders: msg.responseHeaders || {},
       status: msg.status || 'discovered',
+      biliMeta: msg.biliMeta || '',
       time: Date.now(),
       source: msg.source || 'content',
     })
@@ -1173,3 +1208,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   return false
 })
+
+restoreSession()

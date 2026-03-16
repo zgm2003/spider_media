@@ -158,4 +158,83 @@
   patchXhr()
   patchAudio()
   patchObjectUrl()
+
+  /* ── B站 playinfo 拦截 ── */
+
+  const BILI_QUALITY_LABELS = {
+    6: '240P', 16: '360P', 32: '480P', 64: '720P', 74: '720P60',
+    80: '1080P', 112: '1080P+', 116: '1080P60', 120: '4K', 125: 'HDR', 126: '杜比视界', 127: '8K',
+  }
+  const BILI_AUDIO_LABELS = { 30216: '64K', 30232: '132K', 30280: '192K', 30250: '杜比全景声', 30251: 'Hi-Res' }
+
+  function extractBilibiliStreams(info) {
+    const dash = info?.data?.dash
+    if (!dash) return
+
+    const videos = dash.video || []
+    const audios = dash.audio || []
+    const flac = dash.flac?.audio
+    const dolby = dash.dolby?.audio
+
+    for (const v of videos) {
+      const url = v.baseUrl || v.base_url || v.backupUrl?.[0] || v.backup_url?.[0] || ''
+      if (!url) continue
+      const qlabel = BILI_QUALITY_LABELS[v.id] || `${v.id}`
+      const res = v.width && v.height ? `${v.width}x${v.height}` : ''
+      const fname = `[${qlabel}${res ? '_' + res : ''}${v.codecs ? '_' + v.codecs.split('.')[0] : ''}] video.m4s`
+      emit(url, 'bilibili-dash-video', {
+        categoryHint: 'video',
+        contentType: v.mimeType || v.mime_type || 'video/mp4',
+        filename: fname,
+        sizeBytes: v.size || v.bandwidth || '',
+        biliMeta: JSON.stringify({ type: 'video', quality: v.id, qlabel, codecs: v.codecs || '', width: v.width || 0, height: v.height || 0, bandwidth: v.bandwidth || 0 }),
+      })
+    }
+
+    const allAudios = [...audios]
+    if (flac) allAudios.push(flac)
+    if (dolby) allAudios.push(...(Array.isArray(dolby) ? dolby : [dolby]))
+
+    for (const a of allAudios) {
+      const url = a.baseUrl || a.base_url || a.backupUrl?.[0] || a.backup_url?.[0] || ''
+      if (!url) continue
+      const qlabel = BILI_AUDIO_LABELS[a.id] || `${a.id}`
+      const fname = `[${qlabel}${a.codecs ? '_' + a.codecs.split('.')[0] : ''}] audio.m4s`
+      emit(url, 'bilibili-dash-audio', {
+        categoryHint: 'audio',
+        contentType: a.mimeType || a.mime_type || 'audio/mp4',
+        filename: fname,
+        sizeBytes: a.size || a.bandwidth || '',
+        biliMeta: JSON.stringify({ type: 'audio', quality: a.id, qlabel, codecs: a.codecs || '', bandwidth: a.bandwidth || 0 }),
+      })
+    }
+  }
+
+  function tryExtractBilibili() {
+    try {
+      if (window.__playinfo__) extractBilibiliStreams(window.__playinfo__)
+    } catch (_) {}
+  }
+
+  if (/bilibili\.com/i.test(location.hostname)) {
+    let _playinfo = undefined
+    try {
+      _playinfo = window.__playinfo__
+      Object.defineProperty(window, '__playinfo__', {
+        get() { return _playinfo },
+        set(value) {
+          _playinfo = value
+          try { extractBilibiliStreams(value) } catch (_) {}
+        },
+        configurable: true,
+        enumerable: true,
+      })
+    } catch (_) {}
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tryExtractBilibili, { once: true })
+    } else {
+      tryExtractBilibili()
+    }
+  }
 })()

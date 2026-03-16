@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box }
-body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #333 }
+body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #333; overflow: hidden }
 
 .header { padding: 12px 16px; background: #409eff; color: #fff; display: flex; align-items: center; justify-content: space-between }
 .header h1 { font-size: 15px; font-weight: 600 }
@@ -15,7 +15,7 @@ body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHe
 .toolbar .actions { display: flex; gap: 6px }
 .page-url { font-size: 12px; color: #909399 }
 
-.media-list { max-height: 440px; overflow-y: auto }
+.media-list { max-height: 420px; overflow-y: auto }
 .media-item { background: #fff; border: 1px solid #ebeef5; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; transition: border-color .16s ease, box-shadow .16s ease }
 .media-item.expanded { border-color: #bfdcff; box-shadow: 0 0 0 1px rgba(64,158,255,.1) }
 .media-item .row { display: flex; align-items: center; justify-content: space-between; gap: 8px }
@@ -84,6 +84,12 @@ body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHe
 .analysis-sub { font-size: 11px; color: #909399; margin-top: 2px; line-height: 1.4; word-break: break-word }
 .analysis-empty { font-size: 11px; color: #909399; line-height: 1.5 }
 
+.sort-select { padding: 4px 6px; font-size: 11px; border: 1px solid #dcdfe6; border-radius: 4px; background: #fff; color: #606266; cursor: pointer; margin-left: auto }
+
+.batch-bar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; flex-wrap: wrap }
+.batch-bar .batch-label { font-size: 11px; color: #909399; white-space: nowrap }
+.platform-tag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 600; background: #f0f2f5; color: #606266; letter-spacing: .02em }
+
 .preview-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 9999; padding: 20px }
 .preview-mask.show { display: flex }
 .preview-img { max-width: min(90vw, 980px); max-height: 85vh; border-radius: 8px; background: #fff; box-shadow: 0 10px 30px rgba(0,0,0,.35) }
@@ -120,6 +126,18 @@ body { width: 460px; min-height: 320px; font-family: "Segoe UI", "Microsoft YaHe
 
   <div class="status-note" id="statusNote" data-tone="info"></div>
   <div class="tabs" id="tabs"></div>
+  <div class="batch-bar" id="batchBar" style="display:none">
+    <span class="batch-label" id="batchLabel">批量：</span>
+    <button class="btn-alt" id="btnBatchUrls">复制全部 URL</button>
+    <button class="btn-alt" id="btnBatchFfmpeg">复制全部 ffmpeg</button>
+    <button class="btn-alt" id="btnBatchDownload">全部下载</button>
+    <select class="sort-select" id="sortSelect">
+      <option value="time">按时间</option>
+      <option value="size">按大小</option>
+      <option value="name">按名称</option>
+      <option value="platform">按平台</option>
+    </select>
+  </div>
   <div class="media-list" id="mediaList"></div>
 
   <div class="empty" id="emptyTip">

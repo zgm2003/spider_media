@@ -42,6 +42,39 @@
       extraIgnore: [],
     },
     {
+      name: 'bilibili',
+      host: /(^|\.)(bilibili\.com|bilivideo\.com|bilivideo\.cn|akamaized\.net)$/i,
+      extraMediaExt: null,
+      extraIgnore: [/\/tracker\?/i, /\/web-interface\/report/i, /\/x\/report/i],
+      downloadHint: 'B站视频与音频为分离的 m4s 文件，需用 ffmpeg 合并：ffmpeg -i video.m4s -i audio.m4s -c copy output.mp4',
+    },
+    {
+      name: 'douyin',
+      host: /(^|\.)(douyin\.com|douyinvod\.com|zjcdn\.com|snssdk\.com)$/i,
+      extraMediaExt: null,
+      extraIgnore: [/\/log_settings/i, /\/frontier\//i, /\/webcast\//i, /\/aweme\/v1\/web\/report/i],
+      downloadHint: '抖音视频链接有时效性，过期后需重新打开页面捕获。',
+    },
+    {
+      name: 'youtube',
+      host: /(^|\.)(youtube\.com|youtu\.be|googlevideo\.com|ytimg\.com)$/i,
+      extraMediaExt: null,
+      extraIgnore: [/\/generate_204/i, /\/log_event/i, /\/ptracking/i, /\/api\/stats/i],
+      downloadHint: 'YouTube 视频与音频可能分离传输。建议使用 yt-dlp 直接下载页面地址以获取最佳画质。',
+    },
+    {
+      name: 'tiktok',
+      host: /(^|\.)(tiktok\.com|tiktokcdn\.com|musical\.ly)$/i,
+      extraMediaExt: null,
+      extraIgnore: [/\/log\//i, /\/report\//i],
+    },
+    {
+      name: 'twitter',
+      host: /(^|\.)(twitter\.com|x\.com|twimg\.com|video\.twimg\.com)$/i,
+      extraMediaExt: null,
+      extraIgnore: [],
+    },
+    {
       name: 'generic',
       host: /.*/,
       extraMediaExt: null,
@@ -230,7 +263,11 @@
   function getDownloadNotice(record) {
     const mode = getDownloadMode(record)
     if (mode === 'manifest') return '检测到流媒体索引文件，建议先分析或复制 ffmpeg 命令，而不是直接下载索引文件。'
-    if (mode === 'segment') return '检测到流媒体分片，这个文件只是整段流媒体中的一个切片。'
+    if (mode === 'segment') {
+      const strategy = getPlatformStrategy(record?.url || '')
+      const hint = strategy.downloadHint || ''
+      return '检测到流媒体分片，这个文件只是整段流媒体中的一个切片。' + (hint ? ' ' + hint : '')
+    }
     return ''
   }
 

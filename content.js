@@ -32,13 +32,15 @@
     chrome.runtime.sendMessage({
       type: Shared.MESSAGE_TYPES.MEDIA_FOUND,
       url: absUrl,
-      filename: Shared.extractFilename(absUrl),
+      filename: extra?.filename || Shared.extractFilename(absUrl),
       category,
       categoryHint,
       platform: Shared.getPlatformStrategy(absUrl, location.href).name,
       contentType,
       referer: location.href,
       source,
+      sizeBytes: extra?.sizeBytes || '',
+      biliMeta: extra?.biliMeta || '',
     })
   }
 
@@ -107,6 +109,9 @@
     reportMedia(detail.url, detail.source || 'page-bridge', {
       categoryHint: detail.categoryHint || '',
       contentType: detail.contentType || '',
+      filename: detail.filename || '',
+      sizeBytes: detail.sizeBytes || '',
+      biliMeta: detail.biliMeta || '',
     })
   })
 

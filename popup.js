@@ -14,6 +14,7 @@ let currentTabId = null
 const streamContextByKey = new Map()
 const pendingStreamKeys = new Set()
 const expandedKeys = new Set()
+let sortMode = 'time'
 
 const mediaListEl = document.getElementById('mediaList')
 const emptyTip = document.getElementById('emptyTip')
@@ -29,6 +30,9 @@ const setOtherEl = document.getElementById('setOther')
 const settingsPanelEl = document.getElementById('settingsPanel')
 const btnSettingsEl = document.getElementById('btnSettings')
 const statusNoteEl = document.getElementById('statusNote')
+const sortSelectEl = document.getElementById('sortSelect')
+const batchBarEl = document.getElementById('batchBar')
+const batchLabelEl = document.getElementById('batchLabel')
 
 const TAB_ORDER = ['video', 'image', 'audio', 'other']
 const TAB_LABEL = {
@@ -65,6 +69,12 @@ function statusLabel(item) {
   if (status === 'discovered') return ''
   const text = STATUS_LABEL[status] || status
   return `<span class="tag status ${Shared.escapeHtml(status)}">${Shared.escapeHtml(text)}</span>`
+}
+
+function platformLabel(item) {
+  const name = item.platform || 'generic'
+  if (name === 'generic') return ''
+  return `<span class="platform-tag">${Shared.escapeHtml(name)}</span>`
 }
 
 function isManifestItem(item) {
@@ -141,8 +151,57 @@ function formatHeadersDisplay(headers) {
   return entries.map(([k, v]) => `${Shared.escapeHtml(k)}: ${Shared.escapeHtml(v)}`).join('\n')
 }
 
+function parseBiliMeta(item) {
+  if (!item.biliMeta) return null
+  try { return JSON.parse(item.biliMeta) } catch (_) { return null }
+}
+
+function biliLabel(item) {
+  const meta = parseBiliMeta(item)
+  if (!meta) return ''
+  if (meta.type === 'video') {
+    const parts = [meta.qlabel || '', meta.width && meta.height ? `${meta.width}x${meta.height}` : '', meta.codecs || ''].filter(Boolean)
+    return `<span class="platform-tag">${Shared.escapeHtml(parts.join(' '))}</span>`
+  }
+  if (meta.type === 'audio') {
+    const parts = [meta.qlabel || '', meta.codecs || ''].filter(Boolean)
+    return `<span class="platform-tag">${Shared.escapeHtml(parts.join(' '))}</span>`
+  }
+  return ''
+}
+
+function findBestBiliAudio() {
+  let best = null
+  let bestBw = -1
+  for (const item of currentMedia) {
+    const meta = parseBiliMeta(item)
+    if (!meta || meta.type !== 'audio') continue
+    const bw = meta.bandwidth || meta.quality || 0
+    if (bw > bestBw) { bestBw = bw; best = item }
+  }
+  return best
+}
+
+function buildBiliMergeCommand(videoItem) {
+  const audioItem = findBestBiliAudio()
+  if (!audioItem) return ''
+  const referer = videoItem.referer || 'https://www.bilibili.com'
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+  const meta = parseBiliMeta(videoItem)
+  const qlabel = meta?.qlabel || 'video'
+  const outName = `bilibili_${qlabel}.mp4`
+  return `ffmpeg -user_agent "${ua}" -referer "${referer}" -i "${videoItem.url}" -i "${audioItem.url}" -c copy -movflags +faststart "${outName}"`
+}
+
 function getContextNoteHtml(item) {
   const notes = []
+  const meta = parseBiliMeta(item)
+  if (meta?.type === 'video') {
+    notes.push('B站视频与音频分离，点击「合并命令」可生成包含视频+最佳音频的 ffmpeg 命令。')
+  }
+  if (meta?.type === 'audio') {
+    notes.push('B站音频轨道，需与视频轨道合并使用。')
+  }
   if (item.hasCookieHeader) {
     notes.push('请求中包含 Cookie，离站复现时可能需要手动添加。')
   }
@@ -361,18 +420,41 @@ function getDetailsPanelHtml(item) {
   </div>`
 }
 
+function sortItems(list, mode) {
+  const copy = list.slice()
+  if (mode === 'size') return copy.sort((a, b) => (b.sizeBytes || 0) - (a.sizeBytes || 0))
+  if (mode === 'name') return copy.sort((a, b) => (a.filename || '').localeCompare(b.filename || ''))
+  if (mode === 'platform') return copy.sort((a, b) => (a.platform || '').localeCompare(b.platform || '') || (b.time || 0) - (a.time || 0))
+  return copy.sort((a, b) => (b.time || 0) - (a.time || 0))
+}
+
+function getVisibleList() {
+  const filtered = normalizedMedia.filter((item) => item._category === activeTab)
+  return sortItems(filtered, sortMode)
+}
+
+function updateBatchBar(list) {
+  if (!batchBarEl || !batchLabelEl) return
+  if (list.length < 2) {
+    batchBarEl.style.display = 'none'
+    return
+  }
+  batchBarEl.style.display = 'flex'
+  batchLabelEl.textContent = `批量 (${list.length})：`
+}
+
 function renderActiveList() {
-  const list = normalizedMedia
-    .filter((item) => item._category === activeTab)
-    .sort((left, right) => (right.time || 0) - (left.time || 0))
+  const list = getVisibleList()
 
   if (!list.length) {
     mediaListEl.innerHTML = ''
     emptyTip.style.display = 'block'
+    updateBatchBar([])
     return
   }
 
   emptyTip.style.display = 'none'
+  updateBatchBar(list)
 
   mediaListEl.innerHTML = list.map((item) => {
     const key = getItemKey(item)
@@ -390,14 +472,21 @@ function renderActiveList() {
     ].filter(Boolean).join('')
     const note = item.downloadNotice ? `<div class="note">${Shared.escapeHtml(item.downloadNotice)}</div>` : ''
 
+    const biliMergeBtn = parseBiliMeta(item)?.type === 'video'
+      ? `<button class="btn-alt js-bili-merge" data-key="${Shared.escapeHtml(key)}">合并命令</button>`
+      : ''
+
     return `<div class="media-item${expandedClass}" data-key="${Shared.escapeHtml(key)}">
       <div class="row">
         ${typeLabel(item._category)}
         ${streamLabel(item)}
         ${statusLabel(item)}
+        ${platformLabel(item)}
+        ${biliLabel(item)}
         ${previewHtml}
         <span class="filename" title="${Shared.escapeHtml(item.filename || 'media')}">${Shared.escapeHtml(item.filename || 'media')}</span>
         <div class="row-actions">
+          ${biliMergeBtn}
           <button class="btn-alt js-expand" data-key="${Shared.escapeHtml(key)}">${isExpanded ? '收起' : '详情'}</button>
           <button class="btn-dl" data-id="${Shared.escapeHtml(item.id)}" data-key="${Shared.escapeHtml(key)}">下载</button>
         </div>
@@ -697,6 +786,21 @@ mediaListEl.addEventListener('click', (event) => {
     return
   }
 
+  const biliMergeBtn = event.target.closest('.js-bili-merge')
+  if (biliMergeBtn) {
+    const item = findMediaByKey(biliMergeBtn.dataset.key)
+    if (!item) return
+    const cmd = buildBiliMergeCommand(item)
+    if (!cmd) {
+      setStatusNote('未找到音频轨道，无法生成合并命令。', 'error')
+      return
+    }
+    copyText(cmd).then((ok) => {
+      setStatusNote(ok ? 'ffmpeg 合并命令已复制到剪贴板，粘贴到终端执行即可。' : '复制失败。', ok ? 'success' : 'error')
+    })
+    return
+  }
+
   const streamButton = event.target.closest('.js-stream-action')
   if (streamButton) {
     handleStreamAction(streamButton.dataset.key, streamButton.dataset.action)
@@ -756,6 +860,80 @@ setVideoEl?.addEventListener('change', () => updateCaptureSettings({ video: !!se
 setImageEl?.addEventListener('change', () => updateCaptureSettings({ image: !!setImageEl.checked }))
 setAudioEl?.addEventListener('change', () => updateCaptureSettings({ audio: !!setAudioEl.checked }))
 setOtherEl?.addEventListener('change', () => updateCaptureSettings({ other: !!setOtherEl.checked }))
+
+sortSelectEl?.addEventListener('change', () => {
+  sortMode = sortSelectEl.value || 'time'
+  renderActiveList()
+})
+
+document.getElementById('btnBatchUrls')?.addEventListener('click', async () => {
+  const list = getVisibleList()
+  const urls = list.map((item) => item.url).filter(Boolean).join('\n')
+  const ok = await copyText(urls)
+  setStatusNote(ok ? `${list.length} 条 URL 已复制。` : '复制失败。', ok ? 'success' : 'error')
+})
+
+document.getElementById('btnBatchFfmpeg')?.addEventListener('click', async () => {
+  const list = getVisibleList().filter((item) => isManifestItem(item))
+  if (!list.length) {
+    setStatusNote('当前分类下没有流媒体索引文件。', 'warn')
+    return
+  }
+
+  setStatusNote(`正在分析 ${list.length} 个流媒体索引...`, 'info')
+  const commands = []
+  for (const item of list) {
+    const context = await ensureStreamContext(item)
+    const cmd = context?.exports?.commands?.ffmpeg || context?.command || ''
+    if (cmd) commands.push(cmd)
+  }
+
+  if (!commands.length) {
+    setStatusNote('没有可用的 ffmpeg 命令。', 'warn')
+    return
+  }
+
+  const ok = await copyText(commands.join('\n\n'))
+  setStatusNote(ok ? `${commands.length} 条 ffmpeg 命令已复制。` : '复制失败。', ok ? 'success' : 'error')
+})
+
+document.getElementById('btnBatchDownload')?.addEventListener('click', () => {
+  const list = getVisibleList().filter((item) => !isManifestItem(item))
+  if (!list.length) {
+    setStatusNote('当前分类下没有可直接下载的资源。', 'warn')
+    return
+  }
+
+  let done = 0
+  let failed = 0
+  setStatusNote(`开始批量下载 ${list.length} 个资源...`, 'info')
+
+  for (const item of list) {
+    chrome.runtime.sendMessage(
+      {
+        type: Shared.MESSAGE_TYPES.DOWNLOAD,
+        tabId: currentTabId,
+        key: getItemKey(item),
+        frameId: item.frameId,
+        url: item.url,
+        filename: item.filename,
+        category: Shared.normalizeCategory(item),
+        contentType: item.contentType,
+        referer: item.referer,
+        sizeBytes: item.sizeBytes,
+        requestHeaders: item.requestHeaders || {},
+        responseHeaders: item.responseHeaders || {},
+      },
+      (resp) => {
+        if (resp?.ok) done++
+        else failed++
+        if (done + failed >= list.length) {
+          setStatusNote(`批量下载完成：${done} 成功${failed ? `，${failed} 失败` : ''}。`, failed ? 'warn' : 'success')
+        }
+      }
+    )
+  }
+})
 
 if (previewMaskEl && previewImgEl) {
   previewMaskEl.addEventListener('click', () => {

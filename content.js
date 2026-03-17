@@ -68,11 +68,10 @@
         })
       }
     }
-    if (tagName === 'A' && el.href) reportMedia(el.href, source, { categoryHint: 'other' })
   }
 
   function scanExisting() {
-    document.querySelectorAll('audio, video, img, source, a[href]').forEach((el) => {
+    document.querySelectorAll('audio, video, img, source').forEach((el) => {
       reportElementMedia(el, 'scan')
     })
   }
@@ -83,7 +82,7 @@
         if (node.nodeType !== 1) continue
         reportElementMedia(node, 'element')
         if (node.querySelectorAll) {
-          node.querySelectorAll('audio, video, img, source, a[href]').forEach((child) => {
+          node.querySelectorAll('audio, video, img, source').forEach((child) => {
             reportElementMedia(child, 'element')
           })
         }
@@ -100,7 +99,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src', 'poster', 'href', 'srcset'],
+      attributeFilter: ['src', 'poster', 'srcset'],
     })
   }
 
@@ -257,8 +256,9 @@
 
   function renderDock() {
     if (!dockRoot) return
+    const visibleDockMedia = dockMedia.filter((item) => Shared.isLikelyUsefulResource(item))
     const counts = { video: 0, image: 0, audio: 0, other: 0 }
-    dockMedia.forEach((item) => {
+    visibleDockMedia.forEach((item) => {
       counts[Shared.normalizeCategory(item)] += 1
     })
 
@@ -266,14 +266,14 @@
       dockActiveTab = DOCK_TAB_ORDER.find((key) => counts[key] > 0) || 'video'
     }
 
-    dockRoot.querySelector('#msDockCount').textContent = `${dockMedia.length} 个`
+    dockRoot.querySelector('#msDockCount').textContent = `${visibleDockMedia.length} 个`
     dockRoot.querySelector('#msDockTabs').innerHTML = DOCK_TAB_ORDER.map((key) => {
       const activeClass = key === dockActiveTab ? 'active' : ''
       const disabled = counts[key] ? '' : 'disabled'
       return `<button class="ms-tab ${activeClass}" data-cat="${key}" ${disabled}>${DOCK_TAB_LABEL[key]} (${counts[key] || 0})</button>`
     }).join('')
 
-    const list = dockMedia
+    const list = visibleDockMedia
       .filter((item) => Shared.normalizeCategory(item) === dockActiveTab)
       .sort((left, right) => (right.time || 0) - (left.time || 0))
 

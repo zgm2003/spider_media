@@ -10,6 +10,7 @@ let activeTab = 'video'
 let normalizedMedia = []
 let captureSettings = { ...Shared.DEFAULT_CAPTURE_SETTINGS }
 let currentTabId = null
+let hiddenNoiseCount = 0
 
 const streamContextByKey = new Map()
 const pendingStreamKeys = new Set()
@@ -428,8 +429,12 @@ function sortItems(list, mode) {
   return copy.sort((a, b) => (b.time || 0) - (a.time || 0))
 }
 
+function getVisibleMedia() {
+  return normalizedMedia.filter((item) => !item._hiddenNoise)
+}
+
 function getVisibleList() {
-  const filtered = normalizedMedia.filter((item) => item._category === activeTab)
+  const filtered = getVisibleMedia().filter((item) => item._category === activeTab)
   return sortItems(filtered, sortMode)
 }
 
@@ -519,13 +524,14 @@ function loadSniffData() {
       }
     }
 
-    countBadge.textContent = `${currentMedia.length} 个资源`
-
     if (!currentMedia.length) {
       normalizedMedia = []
+      hiddenNoiseCount = 0
       tabsEl.innerHTML = ''
       mediaListEl.innerHTML = ''
       emptyTip.style.display = 'block'
+      countBadge.textContent = '0 个资源'
+      updateBatchBar([])
       return
     }
 
@@ -533,10 +539,14 @@ function loadSniffData() {
     normalizedMedia = currentMedia.map((item) => ({
       ...item,
       _category: Shared.normalizeCategory(item),
+      _hiddenNoise: !Shared.isLikelyUsefulResource(item),
     }))
+    hiddenNoiseCount = normalizedMedia.filter((item) => item._hiddenNoise).length
+    const visibleMedia = getVisibleMedia()
+    countBadge.textContent = `${visibleMedia.length} 个资源${hiddenNoiseCount ? ` / 过滤 ${hiddenNoiseCount}` : ''}`
 
     const counts = { video: 0, image: 0, audio: 0, other: 0 }
-    normalizedMedia.forEach((item) => {
+    visibleMedia.forEach((item) => {
       counts[item._category] += 1
     })
 
@@ -759,7 +769,7 @@ tabsEl.addEventListener('click', (event) => {
   if (!button || button.disabled) return
   activeTab = button.dataset.cat
   const counts = { video: 0, image: 0, audio: 0, other: 0 }
-  normalizedMedia.forEach((item) => {
+  getVisibleMedia().forEach((item) => {
     counts[item._category] += 1
   })
   renderTabs(counts)
@@ -824,6 +834,7 @@ document.getElementById('btnClear').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: Shared.MESSAGE_TYPES.CLEAR_MEDIA }, () => {
     currentMedia = []
     normalizedMedia = []
+    hiddenNoiseCount = 0
     streamContextByKey.clear()
     pendingStreamKeys.clear()
     expandedKeys.clear()

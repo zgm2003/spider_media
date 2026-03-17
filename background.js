@@ -273,6 +273,7 @@ function upsertMediaRecord(tabId, nextItem) {
   })
 
   if (!Shared.isCategoryEnabled(captureSettings, normalized.category)) return
+  if (!existing && normalized.source === 'webRequest' && !Shared.isLikelyUsefulResource(normalized)) return
 
   state.recordsByKey.set(key, existing ? mergeMediaRecord(existing, normalized) : normalized)
   trimTabState(state)

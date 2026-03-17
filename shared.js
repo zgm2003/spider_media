@@ -15,6 +15,11 @@
   }
   const MAX_MEDIA_PER_TAB = 500
   const MAX_INLINE_DOWNLOAD_BYTES = 20 * 1024 * 1024
+  const MIN_VISIBLE_IMAGE_BYTES = 2 * 1024
+  const MIN_VISIBLE_AUDIO_BYTES = 16 * 1024
+  const MIN_VISIBLE_VIDEO_BYTES = 24 * 1024
+  const MIN_VISIBLE_OTHER_BYTES = 32 * 1024
+  const MIN_VISIBLE_SEGMENT_BYTES = 1024 * 1024
 
   const AUDIO_EXTS = /\.(mp3|wav|flac|m4a|ogg|aac|wma|opus)(\?|$)/i
   const VIDEO_EXTS = /\.(mp4|webm|mkv|mov|avi|m3u8|ts|m4s|mpd)(\?|$)/i
@@ -271,6 +276,35 @@
     return ''
   }
 
+  function isLikelyUsefulResource(record) {
+    if (!record) return false
+
+    const category = normalizeCategory(record)
+    const mode = getDownloadMode(record)
+    const sizeBytes = parseContentLength(record.sizeBytes)
+    const sourceList = Array.isArray(record.sourceList) ? record.sourceList : []
+    const hasStructuredMetadata = !!record.biliMeta
+    const isDomDiscovered = sourceList.some((value) => /^(scan|element|page-)/i.test(String(value || '')))
+
+    if (record.status === 'downloaded' || record.status === 'exported') return true
+    if (hasStructuredMetadata || isBlobUrl(record.url, record.referer || '')) return true
+    if (mode === 'manifest') return true
+
+    if (mode === 'segment') {
+      if (hasStructuredMetadata) return true
+      return sizeBytes >= MIN_VISIBLE_SEGMENT_BYTES
+    }
+
+    if (!sizeBytes) {
+      return category !== 'other' || isDomDiscovered
+    }
+
+    if (category === 'image') return sizeBytes >= MIN_VISIBLE_IMAGE_BYTES
+    if (category === 'audio') return sizeBytes >= MIN_VISIBLE_AUDIO_BYTES
+    if (category === 'video') return sizeBytes >= MIN_VISIBLE_VIDEO_BYTES
+    return sizeBytes >= MIN_VISIBLE_OTHER_BYTES
+  }
+
   function escapeHtml(value) {
     return String(value)
       .replace(/&/g, '&amp;')
@@ -306,6 +340,7 @@
     isBlobUrl,
     isCategoryEnabled,
     isHttpUrl,
+    isLikelyUsefulResource,
     isStreamManifest,
     isStreamSegment,
     normalizeCategory,

@@ -12,6 +12,15 @@
   const EVENT_NAME = 'media-sniffer:bridge-found'
   const seen = new Set()
   const MAX_SEEN = 2000
+  const SENSITIVE_HOST_PATTERNS = [
+    /(^|\.)(bilibili\.com|bilivideo\.com|bilivideo\.cn|akamaized\.net)$/i,
+    /(^|\.)(douyin\.com|douyinvod\.com|zjcdn\.com|snssdk\.com)$/i,
+    /(^|\.)(youtube\.com|youtu\.be|googlevideo\.com|ytimg\.com)$/i,
+    /(^|\.)(tiktok\.com|tiktokcdn\.com|musical\.ly)$/i,
+    /(^|\.)(twitter\.com|x\.com|twimg\.com|video\.twimg\.com)$/i,
+  ]
+  const isTopFrame = window.top === window
+  const bridgeMode = SENSITIVE_HOST_PATTERNS.some((pattern) => pattern.test(location.hostname)) ? 'lite' : 'full'
 
   function toAbsoluteUrl(url) {
     try {
@@ -154,10 +163,13 @@
 
   patchProperty(HTMLMediaElement.prototype, 'src', (target) => resolveCategoryHint(target, 'video'))
   patchProperty(HTMLSourceElement.prototype, 'src', (target) => resolveCategoryHint(target, ''))
-  patchFetch()
-  patchXhr()
   patchAudio()
   patchObjectUrl()
+
+  if (isTopFrame && bridgeMode === 'full') {
+    patchFetch()
+    patchXhr()
+  }
 
   /* ── B站 playinfo 拦截 ── */
 
@@ -216,7 +228,7 @@
     } catch (_) {}
   }
 
-  if (/bilibili\.com/i.test(location.hostname)) {
+  if (isTopFrame && /bilibili\.com/i.test(location.hostname)) {
     let _playinfo = undefined
     try {
       _playinfo = window.__playinfo__
